@@ -1,5 +1,5 @@
 """PostgreSQL-backed route, service, and booking store."""
-from datetime import date, time
+from datetime import date, datetime, time
 from typing import Dict, List, Optional
 
 import psycopg2
@@ -217,16 +217,21 @@ def get_route(route_id: str) -> Optional[Dict]:
 
 
 def get_route_services(route_id: str) -> List[Dict]:
+    now = datetime.now()
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT id, route_id, service_date, service_time, status, capacity
                 FROM route_services
-                WHERE route_id = %s AND status = 'active' AND service_date >= current_date
+                WHERE route_id = %s AND status = 'active' AND (
+                    service_date > current_date OR (
+                        service_date = current_date AND service_time > %s
+                    )
+                )
                 ORDER BY service_date, service_time
                 """,
-                (route_id,),
+                (route_id, now.time()),
             )
             return [dict(row) for row in cur.fetchall()]
 
