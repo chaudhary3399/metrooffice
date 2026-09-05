@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Contact MetroOffice Shuttle support.">
+  <title>Contact | MetroOffice Shuttle</title>
+  <link rel="stylesheet" href="/site/styles.css">
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="/"><span class="brand-mark">M</span><span>MetroOffice <em>Shuttle</em></span></a></header>
+  <main class="legal-page">
+    <a class="legal-back" href="/">Back to home</a>
+    <p class="kicker">Support</p>
+    <h1>Contact us</h1>
+    <h2>Booking support</h2>
+    <p>For route selection, seat availability, payment, or booking help, use the WhatsApp booking button on the homepage.</p>
+    <p>Support email: <a id="support-email" href="mailto:support@example.com">support@example.com</a></p>
+    <p>WhatsApp: <a id="whatsapp-link" href="/">Open booking support</a></p>
+    <p>Service area: Noida 15 Metro Station and Oxygen Park Office.</p>
+    <h2>Business information</h2>
+    <p>MetroOffice Shuttle provides local office commute shuttle coordination. Please replace the support email and business address with your verified business details before submitting this website to a payment provider.</p>
+  </main>
+  <script>
+    fetch('/api/routes').then(response => response.json()).then(data => {
+      if (data.support_email) {
+        const email = document.querySelector('#support-email');
+        email.href = `mailto:${data.support_email}`;
+        email.textContent = data.support_email;
+      }
+      if (data.whatsapp_number) {
+        document.querySelector('#whatsapp-link').href = `https://wa.me/${data.whatsapp_number.replace(/\D/g, '')}`;
+      }
+    });
+  </script>
+</body>
+</html>

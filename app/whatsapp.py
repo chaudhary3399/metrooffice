@@ -1,5 +1,6 @@
 """Thin wrapper around the WhatsApp Cloud API for sending messages."""
 import logging
+from typing import Optional
 
 import httpx
 
@@ -135,7 +136,7 @@ def _make_sections(rows: list, base_title: str) -> list:
     return sections
 
 
-def send_route_list(to: str, routes: list, display_name: str | None = None) -> dict:
+def send_route_list(to: str, routes: list, display_name: Optional[str] = None) -> dict:
     """Send an interactive list so the user can tap to pick a route."""
     rows = []
     for route in routes:
@@ -172,7 +173,7 @@ def send_route_list(to: str, routes: list, display_name: str | None = None) -> d
     return _post(payload)
 
 
-def send_route_time_list(to: str, services: list, display_name: str | None = None) -> dict:
+def send_route_time_list(to: str, services: list, display_name: Optional[str] = None) -> dict:
     """Send one combined list of route and time options in a single message."""
     rows = []
     for service in services:

@@ -1,0 +1,16 @@
+{
+  "bookings": [],
+  "capacity": 4,
+  "driver_id": null,
+  "driver_name": null,
+  "driver_phone": null,
+  "id": 44867741446880,
+  "last_driver_reminder_at": null,
+  "price": 50,
+  "route_id": "route_2",
+  "route_name": "Oxygen Park Office to Noida 15 Metro Station",
+  "service_date": "2026-08-16",
+  "service_time": "18:00:00",
+  "short_name": "Oxygen Park -> Noida 15",
+  "status": "active"
+}

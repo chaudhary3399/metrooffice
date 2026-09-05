@@ -1,354 +1,80 @@
-"""PostgreSQL-backed route, service, and booking store."""
+"""File-backed route, service, and booking store.
+
+This project intentionally avoids a database dependency. Route definitions live in YAML,
+while service seat availability and bookings are stored in JSON under the app data folder.
+The file lock ensures two users cannot reserve the same seat at the same time.
+"""
+import hashlib
+import json
+import logging
+from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from threading import Event, Thread
 from time import sleep
-from typing import Dict, List, Optional
-
-import psycopg2
+from typing import Dict, Iterable, List, Optional
+import fcntl
 import yaml
-from psycopg2.extras import DictCursor
 
-from .config import DATABASE_URL, ROUTES_FILE, SERVICE_END_HOUR, SERVICE_START_HOUR
+from .config import DATA_DIR, ROUTES_FILE, SEAT_DIR, BOOKINGS_FILE, CUSTOMERS_FILE, SERVICE_END_HOUR, SERVICE_START_HOUR
+from .data_model import (
+    BookingRecord,
+    ServiceState,
+    CustomerRecord,
+    DEFAULT_ROUTES,
+    DEFAULT_SERVICE_HOURS,
+    DEFAULT_DRIVERS,
+    DEFAULT_CONFIG,
+)
 from .whatsapp import send_text
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL must be set in .env to use the Postgres booking store.")
+logger = logging.getLogger(__name__)
 
 _driver_reminder_thread: Optional[Thread] = None
 _driver_reminder_stop_event: Optional[Event] = None
 
 
-def _connect():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=DictCursor)
+def _ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SEAT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _load_default_routes() -> List[Dict]:
-    if not ROUTES_FILE.exists():
-        return []
-    with open(ROUTES_FILE, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-        return data.get("routes", []) if isinstance(data, dict) else []
+def _read_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return default
 
 
-def _seed_default_drivers(cur) -> list:
-    default_drivers = [
-        {
-            "driver_name": "Rahul",
-            "vehicle_type": "Ertiga",
-            "vehicle_number": "UP15DW1234",
-            "phone_number": "1234567890",
-        },
-        {
-            "driver_name": "Amit",
-            "vehicle_type": "Tata Tiago",
-            "vehicle_number": "UP16AB5678",
-            "phone_number": "9876543210",
-        },
-        {
-            "driver_name": "Suresh",
-            "vehicle_type": "Tempo Traveller",
-            "vehicle_number": "UP20CD2468",
-            "phone_number": "9988776655",
-        },
-    ]
-    driver_ids = []
-    for driver in default_drivers:
-        cur.execute(
-            """
-            INSERT INTO drivers (driver_name, vehicle_type, vehicle_number, phone_number, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, now(), now())
-            ON CONFLICT (vehicle_number) DO UPDATE
-            SET driver_name = EXCLUDED.driver_name,
-                vehicle_type = EXCLUDED.vehicle_type,
-                phone_number = EXCLUDED.phone_number,
-                updated_at = now()
-            RETURNING id
-            """,
-            (
-                driver["driver_name"],
-                driver["vehicle_type"],
-                driver["vehicle_number"],
-                driver["phone_number"],
-            ),
-        )
-        row = cur.fetchone()
-        if row:
-            driver_ids.append(row["id"])
-    return driver_ids
+def _write_json_atomic(path: Path, payload) -> None:
+    _ensure_data_dir()
+    temp_path = path.with_suffix(f"{path.suffix}.tmp")
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    temp_path.replace(path)
 
 
-def _seed_default_routes_and_services() -> None:
-    routes = _load_default_routes()
-    if not routes:
-        return
-
-    today = date.today()
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            driver_ids = _seed_default_drivers(cur)
-
-            for route in routes:
-                route_id = route.get("id")
-                if not route_id:
-                    continue
-                name = route.get("name", "")
-                short_name = route.get("short_name", "")
-                price = route.get("price", 0)
-                capacity = route.get("total_seats")
-
-                cur.execute(
-                    """
-                    INSERT INTO routes (route_id, name, short_name, price, active, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, TRUE, now(), now())
-                    ON CONFLICT (route_id) DO UPDATE
-                    SET name = EXCLUDED.name,
-                        short_name = EXCLUDED.short_name,
-                        price = EXCLUDED.price,
-                        updated_at = now()
-                    """,
-                    (route_id, name, short_name, price),
-                )
-
-                if capacity is None:
-                    continue
-
-                service_entries = route.get("service_hours")
-                if isinstance(service_entries, list) and service_entries:
-                    schedule = []
-                    for entry in service_entries:
-                        hour = entry.get("hour")
-                        cap = entry.get("capacity", capacity)
-                        if isinstance(hour, int) and 0 <= hour <= 23:
-                            schedule.append((time(hour, 0), cap))
-                else:
-                    schedule = [(time(hour, 0), capacity) for hour in range(SERVICE_START_HOUR, SERVICE_END_HOUR + 1)]
-
-                for service_time, service_capacity in schedule:
-                    driver_id = None
-                    if driver_ids:
-                        driver_id = driver_ids[(service_time.hour - SERVICE_START_HOUR) % len(driver_ids)]
-                    cur.execute(
-                        """
-                        INSERT INTO route_services (route_id, service_date, service_time, status, capacity, driver_id, created_at, updated_at)
-                        VALUES (%s, %s, %s, 'active', %s, %s, now(), now())
-                        ON CONFLICT (route_id, service_date, service_time) DO UPDATE
-                        SET driver_id = EXCLUDED.driver_id,
-                            status = EXCLUDED.status,
-                            capacity = EXCLUDED.capacity,
-                            updated_at = now()
-                        """,
-                        (route_id, today, service_time, service_capacity, driver_id),
-                    )
-
-            cur.execute(
-                "SELECT id, route_id, capacity FROM route_services WHERE service_date = %s",
-                (today,),
-            )
-            services = cur.fetchall()
-            for service_row in services:
-                route_service_id = service_row["id"]
-                cap = service_row["capacity"]
-                if cap is None:
-                    continue
-                cur.execute(
-                    "SELECT COUNT(*) FROM service_seats WHERE route_service_id = %s",
-                    (route_service_id,),
-                )
-                seat_count = cur.fetchone()[0]
-                if seat_count == 0:
-                    for seat_num in range(1, cap + 1):
-                        cur.execute(
-                            """
-                            INSERT INTO service_seats (route_service_id, seat_number, status, updated_at)
-                            VALUES (%s, %s, 'available', now())
-                            ON CONFLICT (route_service_id, seat_number) DO NOTHING
-                            """,
-                            (route_service_id, seat_num),
-                        )
+def _service_state_path(service_id: int) -> Path:
+    return SEAT_DIR / f"service_{service_id}.json"
 
 
-def seed_today_services() -> None:
-    """Seed today’s routes and hourly services from the default route config."""
-    _seed_default_routes_and_services()
+def _service_lock_path(service_id: int) -> Path:
+    return SEAT_DIR / f"service_{service_id}.lock"
 
 
-def _init_db() -> None:
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS routes (
-                    route_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    short_name TEXT NOT NULL,
-                    price INTEGER NOT NULL,
-                    active BOOLEAN NOT NULL DEFAULT TRUE,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS drivers (
-                    id SERIAL PRIMARY KEY,
-                    driver_name TEXT NOT NULL,
-                    vehicle_type TEXT NOT NULL,
-                    vehicle_number TEXT NOT NULL UNIQUE,
-                    phone_number TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS route_services (
-                    id SERIAL PRIMARY KEY,
-                    route_id TEXT NOT NULL REFERENCES routes(route_id),
-                    service_date DATE NOT NULL,
-                    service_time TIME NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    capacity INTEGER,
-                    driver_id INTEGER REFERENCES drivers(id),
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    UNIQUE (route_id, service_date, service_time)
-                )
-                """
-            )
-            cur.execute(
-                "ALTER TABLE route_services ADD COLUMN IF NOT EXISTS driver_id INTEGER REFERENCES drivers(id)",
-            )
-            cur.execute(
-                "ALTER TABLE route_services ADD COLUMN IF NOT EXISTS last_driver_reminder_at TIMESTAMPTZ",
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS customers (
-                    phone_number TEXT PRIMARY KEY,
-                    customer_name TEXT,
-                    last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS service_seats (
-                    id SERIAL PRIMARY KEY,
-                    route_service_id INTEGER NOT NULL REFERENCES route_services(id) ON DELETE CASCADE,
-                    seat_number INTEGER NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'available',
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    UNIQUE (route_service_id, seat_number)
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bookings (
-                    id SERIAL PRIMARY KEY,
-                    route_id TEXT NOT NULL REFERENCES routes(route_id),
-                    route_service_id INTEGER NOT NULL REFERENCES route_services(id),
-                    service_date DATE NOT NULL,
-                    service_time TIME NOT NULL,
-                    seat_number INTEGER NOT NULL,
-                    driver_id INTEGER REFERENCES drivers(id),
-                    phone_number TEXT NOT NULL REFERENCES customers(phone_number),
-                    customer_name TEXT,
-                    amount INTEGER,
-                    status TEXT NOT NULL DEFAULT 'booked',
-                    payment_ref TEXT,
-                    booked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    UNIQUE (route_service_id, seat_number)
-                )
-                """
-            )
-            cur.execute(
-                "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS driver_id INTEGER REFERENCES drivers(id)",
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_route_services_route_date_time
-                ON route_services(route_id, service_date, service_time)
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_service_seats_route_service
-                ON service_seats(route_service_id)
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_bookings_route_service
-                ON bookings(route_service_id)
-                """
-            )
-    _seed_default_routes_and_services()
-
-
-_init_db()
-
-
-def get_routes() -> List[Dict]:
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT route_id, name, short_name, price FROM routes WHERE active = TRUE ORDER BY route_id"
-            )
-            return [dict(row) for row in cur.fetchall()]
-
-
-def get_route(route_id: str) -> Optional[Dict]:
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT route_id, name, short_name, price, active FROM routes WHERE route_id = %s",
-                (route_id,),
-            )
-            row = cur.fetchone()
-            return dict(row) if row else None
-
-
-def get_route_services(route_id: str) -> List[Dict]:
-    now = datetime.now()
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, route_id, service_date, service_time, status, capacity
-                FROM route_services
-                WHERE route_id = %s AND status = 'active' AND (
-                    service_date > current_date OR (
-                        service_date = current_date AND service_time > %s
-                    )
-                )
-                ORDER BY service_date, service_time
-                """,
-                (route_id, now.time()),
-            )
-            return [dict(row) for row in cur.fetchall()]
-
-
-def get_service(route_service_id: int) -> Optional[Dict]:
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT rs.id, rs.route_id, rs.service_date, rs.service_time, rs.status,
-                       rs.capacity, rs.driver_id, rs.last_driver_reminder_at, r.short_name, r.price, r.name,
-                       d.driver_name, d.vehicle_type, d.vehicle_number, d.phone_number AS driver_phone
-                FROM route_services rs
-                JOIN routes r ON rs.route_id = r.route_id
-                LEFT JOIN drivers d ON rs.driver_id = d.id
-                WHERE rs.id = %s
-                """,
-                (route_service_id,),
-            )
-            row = cur.fetchone()
-            return dict(row) if row else None
+@contextmanager
+def _service_lock(service_id: int):
+    _ensure_data_dir()
+    lock_path = _service_lock_path(service_id)
+    with open(lock_path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def normalize_phone_number(phone: str) -> str:
@@ -362,6 +88,330 @@ def normalize_phone_number(phone: str) -> str:
     if len(digits) > 10 and digits.startswith("91"):
         return digits
     return digits
+
+
+def _load_default_routes() -> List[Dict]:
+    if not ROUTES_FILE.exists():
+        return DEFAULT_ROUTES
+    with open(ROUTES_FILE, "r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle)
+    if isinstance(data, dict):
+        routes = data.get("routes", [])
+        if routes:
+            return routes
+    return DEFAULT_ROUTES
+
+
+def _service_hours_for_route(route: Dict) -> List[time]:
+    service_entries = route.get("service_hours")
+    if isinstance(service_entries, list) and service_entries:
+        hours = []
+        for entry in service_entries:
+            hour = entry.get("hour") if isinstance(entry, dict) else None
+            if isinstance(hour, int) and 0 <= hour <= 23:
+                hours.append(time(hour, 0))
+        if hours:
+            return hours
+
+    total_seats = route.get("total_seats")
+    if total_seats is None:
+        return []
+    
+    # Use DEFAULT_SERVICE_HOURS if available, otherwise generate range
+    if DEFAULT_SERVICE_HOURS:
+        return [time(entry["hour"], 0) for entry in DEFAULT_SERVICE_HOURS if isinstance(entry, dict) and "hour" in entry]
+    return [time(hour, 0) for hour in range(SERVICE_START_HOUR, SERVICE_END_HOUR + 1)]
+
+
+def _service_id_for(route_id: str, service_date: date, service_time: time) -> int:
+    key = f"{route_id}|{service_date.isoformat()}|{service_time.strftime('%H:%M:%S')}"
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+    return int(digest[:12], 16)
+
+
+def _build_service_snapshot(service_id: int, route_id: str, service_date: date, service_time: time, capacity: int, route_name: str, short_name: str, price: int) -> Dict:
+    state = ServiceState(
+        id=service_id,
+        route_id=route_id,
+        service_date=service_date.isoformat(),
+        service_time=service_time.strftime("%H:%M:%S"),
+        status="active",
+        capacity=int(capacity),
+        route_name=route_name,
+        short_name=short_name,
+        price=int(price),
+        driver_id=None,
+        driver_name=None,
+        driver_phone=None,
+        last_driver_reminder_at=None,
+        bookings=[],
+    )
+    return state.to_dict()
+
+
+def _ensure_service_state(
+    service_id: int,
+    route_id: str,
+    service_date: date,
+    service_time: time,
+    capacity: int,
+    route_name: Optional[str] = None,
+    short_name: Optional[str] = None,
+    price: int = 0,
+) -> Dict:
+    _ensure_data_dir()
+    path = _service_state_path(service_id)
+    payload = _read_json(path, None)
+    if payload is None:
+        payload = _build_service_snapshot(service_id, route_id, service_date, service_time, capacity, route_name or route_id, short_name or route_id, price)
+        _write_json_atomic(path, payload)
+        return payload
+
+    payload["route_id"] = route_id
+    payload["service_date"] = payload.get("service_date") or service_date.isoformat()
+    payload["service_time"] = payload.get("service_time") or service_time.strftime("%H:%M:%S")
+    payload["capacity"] = int(payload.get("capacity") or capacity)
+    payload["route_name"] = payload.get("route_name") or route_name or route_id
+    payload["short_name"] = payload.get("short_name") or short_name or route_id
+    payload["price"] = int(payload.get("price") or price)
+    payload["status"] = payload.get("status", "active")
+    payload["bookings"] = payload.get("bookings", [])
+    _write_json_atomic(path, payload)
+    return payload
+
+
+def _load_customer_store() -> Dict:
+    data = _read_json(CUSTOMERS_FILE, {})
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def seed_today_services() -> None:
+    """Create the day’s route service files from the YAML config."""
+    routes = _load_default_routes()
+    for route in routes:
+        route_id = route.get("id")
+        if not route_id:
+            continue
+        capacity = route.get("total_seats")
+        if capacity is None:
+            continue
+        route_name = route.get("name") or route_id
+        short_name = route.get("short_name") or route_id
+        price = route.get("price") or 0
+        for service_time in _service_hours_for_route(route):
+            service_id = _service_id_for(route_id, date.today(), service_time)
+            _ensure_service_state(service_id, route_id, date.today(), service_time, capacity, route_name, short_name, price)
+
+
+def get_routes() -> List[Dict]:
+    routes = _load_default_routes()
+    normalized = []
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        route_id = route.get("route_id") or route.get("id")
+        if not route_id:
+            continue
+        normalized.append({
+            "route_id": route_id,
+            "name": route.get("name") or route.get("short_name") or route_id,
+            "short_name": route.get("short_name") or route.get("name") or route_id,
+            "price": route.get("price") or 0,
+        })
+    return normalized
+
+
+def get_route(route_id: str) -> Optional[Dict]:
+    for route in get_routes():
+        if route.get("route_id") == route_id:
+            return route
+    return None
+
+
+def get_route_services(route_id: str) -> List[Dict]:
+    routes = _load_default_routes()
+    route = next((item for item in routes if str(item.get("id") or item.get("route_id")) == str(route_id)), None)
+    if route is None:
+        return []
+
+    services = []
+    for service_time in _service_hours_for_route(route):
+        service_id = _service_id_for(route_id, date.today(), service_time)
+        state = _ensure_service_state(service_id, route_id, date.today(), service_time, route.get("total_seats") or 0, route.get("name") or route_id, route.get("short_name") or route_id, route.get("price") or 0)
+        services.append({
+            "id": state["id"],
+            "route_id": state["route_id"],
+            "service_date": date.fromisoformat(state["service_date"]),
+            "service_time": datetime.strptime(state["service_time"], "%H:%M:%S").time(),
+            "status": state.get("status", "active"),
+            "capacity": state.get("capacity"),
+            "short_name": state.get("short_name"),
+            "price": state.get("price"),
+            "name": state.get("route_name"),
+        })
+    return [service for service in services if service["service_time"] >= datetime.now().time() or service["service_date"] > date.today()]
+
+
+def get_service(route_service_id: int) -> Optional[Dict]:
+    path = _service_state_path(route_service_id)
+    if not path.exists():
+        return None
+
+    state = _read_json(path, {})
+    if not state:
+        return None
+
+    route = get_route(state.get("route_id") or "")
+    if route is None:
+        route = {
+            "route_id": state.get("route_id"),
+            "name": state.get("route_name") or state.get("route_id"),
+            "short_name": state.get("short_name") or state.get("route_id"),
+            "price": state.get("price") or 0,
+        }
+
+    service_date = state.get("service_date")
+    service_time = state.get("service_time")
+    try:
+        parsed_date = date.fromisoformat(service_date) if service_date else date.today()
+    except ValueError:
+        parsed_date = date.today()
+    try:
+        parsed_time = datetime.strptime(service_time, "%H:%M:%S").time() if service_time else time(0, 0)
+    except ValueError:
+        parsed_time = time(0, 0)
+
+    return {
+        "id": state.get("id") or route_service_id,
+        "route_id": state.get("route_id") or route.get("route_id"),
+        "service_date": parsed_date,
+        "service_time": parsed_time,
+        "status": state.get("status", "active"),
+        "capacity": state.get("capacity"),
+        "driver_id": state.get("driver_id"),
+        "driver_name": state.get("driver_name"),
+        "driver_phone": state.get("driver_phone"),
+        "short_name": state.get("short_name") or route.get("short_name") or route.get("name"),
+        "price": state.get("price") or route.get("price") or 0,
+        "name": state.get("route_name") or route.get("name") or route.get("route_id"),
+        "last_driver_reminder_at": state.get("last_driver_reminder_at"),
+    }
+
+
+def save_customer(phone_number: str, customer_name: Optional[str] = None) -> None:
+    data = _load_customer_store()
+    customer = CustomerRecord(
+        phone_number=phone_number,
+        customer_name=customer_name or data.get(phone_number, {}).get("customer_name"),
+        last_seen=datetime.utcnow().isoformat(),
+    )
+    data[phone_number] = customer.to_dict()
+    _write_json_atomic(CUSTOMERS_FILE, data)
+
+
+def _read_service_state(service_id: int) -> Optional[Dict]:
+    path = _service_state_path(service_id)
+    if not path.exists():
+        return None
+    data = _read_json(path, {})
+    if not isinstance(data, dict):
+        return None
+    data.setdefault("bookings", [])
+    return data
+
+
+def available_seats(route_service_id: int) -> List[int]:
+    service = get_service(route_service_id)
+    if not service or service["status"] != "active":
+        return []
+
+    state = _read_service_state(route_service_id)
+    if state is None:
+        return []
+
+    booked = {int(booking["seat_number"]) for booking in state.get("bookings", []) if booking.get("status") != "cancelled"}
+    return [n for n in range(1, int(service["capacity"] or 0) + 1) if n not in booked]
+
+
+def update_booking_passenger_details(
+    route_service_id: int,
+    seat_numbers: list[int],
+    original_phone: str,
+    new_phone: str,
+    new_name: Optional[str] = None,
+) -> bool:
+    if not seat_numbers:
+        return False
+
+    with _service_lock(route_service_id):
+        state = _read_service_state(route_service_id)
+        if state is None:
+            return False
+
+        updated = False
+        for booking in state.get("bookings", []):
+            seat = booking.get("seat_number")
+            if seat in seat_numbers and booking.get("phone_number") == original_phone:
+                booking["phone_number"] = new_phone
+                booking["customer_name"] = new_name or booking.get("customer_name")
+                updated = True
+
+        if updated:
+            _write_json_atomic(_service_state_path(route_service_id), state)
+            save_customer(new_phone, new_name)
+        return updated
+
+
+def book_seats(route_service_id: int, seat_count: int, phone_number: str, customer_name: Optional[str] = None) -> tuple[bool, list[int], int]:
+    service = get_service(route_service_id)
+    if not service or service["status"] != "active":
+        return False, [], 0
+
+    if seat_count < 1 or seat_count > DEFAULT_CONFIG.get("max_seats_per_booking", 4):
+        return False, [], 0
+
+    now = datetime.now()
+    try:
+        if service.get("service_date") == now.date() and service.get("service_time") <= now.time():
+            return False, [], 0
+    except Exception:
+        return False, [], 0
+
+    save_customer(phone_number, customer_name)
+    with _service_lock(route_service_id):
+        state = _read_service_state(route_service_id)
+        if state is None:
+            return False, [], 0
+
+        bookings = state.get("bookings", [])
+        booked_seats = {int(item["seat_number"]) for item in bookings if item.get("status") != "cancelled"}
+        available = [n for n in range(1, int(service["capacity"] or 0) + 1) if n not in booked_seats]
+        if len(available) < seat_count:
+            return False, [], 0
+
+        selected = available[:seat_count]
+        for seat in selected:
+            booking = BookingRecord(
+                seat_number=int(seat),
+                phone_number=phone_number,
+                customer_name=customer_name,
+                status="booked",
+                amount=int(service.get("price") or 0),
+            )
+            bookings.append(booking.to_dict())
+
+        state["bookings"] = bookings
+        _write_json_atomic(_service_state_path(route_service_id), state)
+
+    total_amount = int(service.get("price") or 0) * len(selected)
+    return True, selected, total_amount
+
+
+def book_seat(route_service_id: int, seat: int, phone_number: str, customer_name: Optional[str] = None) -> bool:
+    success, _, _ = book_seats(route_service_id, 1, phone_number, customer_name)
+    return success
 
 
 def build_driver_reminder_message(service: Dict, passengers: List[Dict]) -> str:
@@ -382,14 +432,11 @@ def send_driver_reminder(route_service_id: int) -> bool:
     if not service:
         return False
 
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT customer_name, phone_number FROM bookings WHERE route_service_id = %s AND status = 'booked' ORDER BY id",
-                (route_service_id,),
-            )
-            passengers = [dict(row) for row in cur.fetchall()]
-
+    state = _read_service_state(route_service_id)
+    passengers = [
+        {"customer_name": item.get("customer_name"), "phone_number": item.get("phone_number")}
+        for item in state.get("bookings", []) if item.get("status") == "booked"
+    ]
     if not passengers:
         return False
 
@@ -402,12 +449,8 @@ def send_driver_reminder(route_service_id: int) -> bool:
     except Exception:
         return False
 
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE route_services SET last_driver_reminder_at = now(), updated_at = now() WHERE id = %s",
-                (route_service_id,),
-            )
+    state["last_driver_reminder_at"] = datetime.utcnow().isoformat()
+    _write_json_atomic(_service_state_path(route_service_id), state)
     return True
 
 
@@ -415,28 +458,17 @@ def process_driver_reminders(now: Optional[datetime] = None) -> int:
     if now is None:
         now = datetime.now()
 
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT rs.id, rs.route_id, rs.service_date, rs.service_time, rs.status,
-                       rs.capacity, rs.driver_id, rs.last_driver_reminder_at, r.short_name, r.price, r.name,
-                       d.driver_name, d.vehicle_type, d.vehicle_number, d.phone_number AS driver_phone
-                FROM route_services rs
-                JOIN routes r ON rs.route_id = r.route_id
-                LEFT JOIN drivers d ON rs.driver_id = d.id
-                WHERE rs.status = 'active' AND rs.last_driver_reminder_at IS NULL
-                """
-            )
-            services = [dict(row) for row in cur.fetchall()]
-
     sent = 0
-    for service in services:
-        departure_dt = datetime.combine(service["service_date"], service["service_time"])
-        remind_at = departure_dt - timedelta(minutes=15)
-        if remind_at <= now < departure_dt:
-            if send_driver_reminder(service["id"]):
-                sent += 1
+    for route in get_routes():
+        for service_row in get_route_services(route["route_id"]):
+            service = get_service(service_row["id"])
+            if not service or service["status"] != "active":
+                continue
+            departure_dt = datetime.combine(service["service_date"], service["service_time"])  # type: ignore[arg-type]
+            remind_at = departure_dt - timedelta(minutes=15)
+            if remind_at <= now < departure_dt:
+                if send_driver_reminder(service["id"]):
+                    sent += 1
     return sent
 
 
@@ -462,150 +494,11 @@ def _driver_reminder_loop(interval_seconds: int) -> None:
         sleep(interval_seconds)
 
 
-def save_customer(phone_number: str, customer_name: Optional[str] = None) -> None:
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO customers (phone_number, customer_name, last_seen)
-                VALUES (%s, %s, now())
-                ON CONFLICT (phone_number) DO UPDATE
-                SET customer_name = COALESCE(EXCLUDED.customer_name, customers.customer_name),
-                    last_seen = now()
-                """,
-                (phone_number, customer_name),
-            )
+def database_available() -> bool:
+    """The file-backed store is always available while the app is running."""
+    return True
 
 
-def available_seats(route_service_id: int) -> List[int]:
-    service = get_service(route_service_id)
-    if not service or service["status"] != "active":
-        return []
-
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT seat_number, status FROM service_seats WHERE route_service_id = %s ORDER BY seat_number",
-                (route_service_id,),
-            )
-            rows = cur.fetchall()
-            if rows:
-                return [row["seat_number"] for row in rows if row["status"] == "available"]
-
-            if service["capacity"] is None:
-                return []
-
-            cur.execute(
-                "SELECT seat_number FROM bookings WHERE route_service_id = %s",
-                (route_service_id,),
-            )
-            booked = {row["seat_number"] for row in cur.fetchall()}
-            return [n for n in range(1, service["capacity"] + 1) if n not in booked]
-
-
-def update_booking_passenger_details(
-    route_service_id: int,
-    seat_numbers: list[int],
-    original_phone: str,
-    new_phone: str,
-    new_name: Optional[str] = None,
-) -> bool:
-    if not seat_numbers:
-        return False
-
-    save_customer(new_phone, new_name)
-    placeholders = ", ".join(["%s"] * len(seat_numbers))
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                UPDATE bookings
-                SET phone_number = %s,
-                    customer_name = %s
-                WHERE route_service_id = %s
-                  AND seat_number IN ({placeholders})
-                  AND phone_number = %s
-                  AND status = 'booked'
-                """,
-                [new_phone, new_name, route_service_id, *seat_numbers, original_phone],
-            )
-            return cur.rowcount > 0
-
-
-def book_seats(route_service_id: int, seat_count: int, phone_number: str, customer_name: Optional[str] = None) -> tuple[bool, list[int], int]:
-    service = get_service(route_service_id)
-    if not service or service["status"] != "active":
-        return False, [], 0
-
-    if seat_count < 1 or seat_count > 4:
-        return False, [], 0
-
-    now = datetime.now()
-    try:
-        svc_date = service.get("service_date")
-        svc_time = service.get("service_time")
-        if svc_date == now.date() and svc_time <= now.time():
-            return False, [], 0
-    except Exception:
-        return False, [], 0
-
-    save_customer(phone_number, customer_name)
-
-    selected_seats = []
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT seat_number
-                FROM service_seats
-                WHERE route_service_id = %s AND status = 'available'
-                ORDER BY seat_number
-                LIMIT %s
-                FOR UPDATE
-                """,
-                (route_service_id, seat_count),
-            )
-            seat_rows = cur.fetchall()
-            if len(seat_rows) < seat_count:
-                return False, [], 0
-
-            selected_seats = [row["seat_number"] for row in seat_rows]
-            for seat in selected_seats:
-                cur.execute(
-                    "UPDATE service_seats SET status = 'booked', updated_at = now() WHERE route_service_id = %s AND seat_number = %s",
-                    (route_service_id, seat),
-                )
-                cur.execute(
-                    """
-                    INSERT INTO bookings (
-                        route_id,
-                        route_service_id,
-                        service_date,
-                        service_time,
-                        seat_number,
-                        driver_id,
-                        phone_number,
-                        customer_name
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (route_service_id, seat_number) DO NOTHING
-                    """,
-                    (
-                        service["route_id"],
-                        route_service_id,
-                        service["service_date"],
-                        service["service_time"],
-                        seat,
-                        service.get("driver_id"),
-                        phone_number,
-                        customer_name,
-                    ),
-                )
-
-    price_per_seat = service.get("price") or 0
-    total_amount = price_per_seat * len(selected_seats)
-    return True, selected_seats, total_amount
-
-
-def book_seat(route_service_id: int, seat: int, phone_number: str, customer_name: Optional[str] = None) -> bool:
-    success, _, _ = book_seats(route_service_id, 1, phone_number, customer_name)
-    return success
+def initialize_database() -> None:
+    """Compatibility no-op kept for older imports and startup code."""
+    seed_today_services()

@@ -3,11 +3,17 @@ WhatsApp webhook for the Metro-to-Office booking bot.
 Step 1: verify webhook, receive messages, reply to any text with the route list,
 and acknowledge a tapped route.
 """
+import hashlib
+import hmac
+import json
 import logging
 import time
 from datetime import datetime
+from typing import Optional
 
-from fastapi import FastAPI, Request, Response, BackgroundTasks
+from fastapi import BackgroundTasks, FastAPI, Request, Response
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from .bookings import (
     available_seats,
@@ -18,10 +24,17 @@ from .bookings import (
     get_service,
     save_customer,
     seed_today_services,
-    start_driver_reminder_worker,
     update_booking_passenger_details,
 )
-from .config import VERIFY_TOKEN, ROUTES_FILE
+from .config import (
+    BUSINESS_NAME,
+    RAZORPAY_PAYMENT_LINK,
+    RAZORPAY_WEBHOOK_SECRET,
+    ROUTES_FILE,
+    SUPPORT_EMAIL,
+    VERIFY_TOKEN,
+    WHATSAPP_CONTACT_NUMBER,
+)
 import yaml
 from .whatsapp import (
     send_route_list,
@@ -39,10 +52,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("metrooffice")
 
 app = FastAPI(title="ShuttleSeva WhatsApp Bot")
+SITE_FILE = ROUTES_FILE.parent.parent / "site" / "index.html"
+app.mount("/site", StaticFiles(directory=SITE_FILE.parent), name="site")
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    start_driver_reminder_worker()
+    logger.info("Startup complete. File-backed booking mode is active.")
 
 latest_event = {}
 debug_info = {
@@ -57,6 +72,27 @@ debug_info = {
 pending_actions = {}
 prompted_numbers = set()
 processed_message_ids = set()
+processed_message_times = {}
+pending_payments = {}
+
+
+def _remember_message_id(message_id: str) -> bool:
+    """Return True only for a new message id; ignore duplicate webhook retries immediately."""
+    if not message_id:
+        return True
+
+    now = time.time()
+    expired = [mid for mid, ts in processed_message_times.items() if now - ts > 3600]
+    for mid in expired:
+        processed_message_times.pop(mid, None)
+        processed_message_ids.discard(mid)
+
+    if message_id in processed_message_ids:
+        return False
+
+    processed_message_ids.add(message_id)
+    processed_message_times[message_id] = now
+    return True
 
 @app.get("/debug/last-event")
 async def debug_last_event():
@@ -111,55 +147,121 @@ def _get_available_services_for_selection() -> list:
     return services
 
 
-def _send_route_selection_prompt(from_number: str, customer_name: str | None = None, background_tasks: BackgroundTasks | None = None) -> None:
+def _send_route_selection_prompt(from_number: str, customer_name: Optional[str] = None, background_tasks: Optional[BackgroundTasks] = None) -> None:
     prompted_numbers.add(from_number)
-    # Send a compact route selection first to keep initial response fast.
-    # Prefer reading routes directly from the YAML file (fast, in-memory),
-    # falling back to the DB-backed `get_routes()` if the file is missing.
     routes = []
     try:
-        if ROUTES_FILE.exists():
-            with open(ROUTES_FILE, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-                routes = data.get("routes", []) if isinstance(data, dict) else []
-    except Exception:
+        routes = get_routes()
+    except Exception as e:
+        logger.error("Failed to get routes: %s", e, exc_info=True)
         routes = []
 
     if not routes:
-        # If no YAML routes, fall back to DB (unchanged behaviour).
-        try:
-            routes = get_routes()
-        except Exception:
-            routes = []
-
-    # Normalize YAML-loaded routes to the DB-shaped dicts the rest of the code expects.
-    normalized_routes = []
-    for r in routes:
-        if not isinstance(r, dict):
-            continue
-        # DB-backed entries use 'route_id'; YAML uses 'id'. Ensure both are present.
-        route_id = r.get("route_id") or r.get("id")
-        if not route_id:
-            continue
-        normalized_routes.append(
-            {
-                "route_id": route_id,
-                "name": r.get("name") or r.get("short_name") or route_id,
-                "short_name": r.get("short_name") or r.get("name") or route_id,
-                "price": r.get("price") or 0,
-            }
-        )
-
-    if normalized_routes:
+        error_msg = "Sorry, there are no routes available right now."
         if background_tasks:
-            background_tasks.add_task(send_route_list, from_number, normalized_routes, customer_name)
+            background_tasks.add_task(send_text, from_number, error_msg)
         else:
-            send_route_list(from_number, normalized_routes, display_name=customer_name)
+            send_text(from_number, error_msg)
+        return
+
+    if background_tasks:
+        background_tasks.add_task(send_route_list, from_number, routes, customer_name)
     else:
-        if background_tasks:
-            background_tasks.add_task(send_text, from_number, "Sorry, there are no routes available right now.")
+        send_route_list(from_number, routes, display_name=customer_name)
+
+
+def _payment_message(amount: int) -> str:
+    return (
+        f"Please complete the payment of Rs {amount} using this Razorpay link:\n"
+        f"{RAZORPAY_PAYMENT_LINK}\n\n"
+        "Your booking will be confirmed automatically after Razorpay confirms the payment."
+    )
+
+
+def _queue_payment(
+    from_number: str,
+    route_service_id: int,
+    seat_count: int,
+    phone_to_book: str,
+    passenger_name: Optional[str],
+    service: dict,
+    background_tasks: BackgroundTasks,
+) -> None:
+    if not RAZORPAY_PAYMENT_LINK:
+        logger.error("RAZORPAY_PAYMENT_LINK is not configured")
+        background_tasks.add_task(send_text, from_number, "Payment is temporarily unavailable. Please try again later.")
+        return
+    amount = int(service.get("price") or 0) * seat_count
+    pending_payments[from_number] = {
+        "route_service_id": route_service_id,
+        "seat_count": seat_count,
+        "phone_to_book": phone_to_book,
+        "passenger_name": passenger_name,
+        "amount": amount,
+    }
+    logger.info("payment requested from=%s service=%s amount=%s", from_number, route_service_id, amount)
+    background_tasks.add_task(send_text, from_number, _payment_message(amount))
+
+
+def _payment_phone(payload: dict) -> Optional[str]:
+    entity = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
+    contact = entity.get("customer", {}).get("contact") or entity.get("contact")
+    if not contact:
+        return None
+    digits = "".join(character for character in str(contact) if character.isdigit())
+    if len(digits) == 10:
+        return f"91{digits}"
+    if digits.startswith("0") and len(digits) == 11:
+        return f"91{digits[1:]}"
+    return digits or None
+
+
+async def _complete_paid_booking(phone: str, background_tasks: BackgroundTasks) -> None:
+    pending = pending_payments.pop(phone, None)
+    if not pending:
+        logger.warning("paid Razorpay webhook has no pending booking for phone=%s", phone)
+        return
+    service = get_service(pending["route_service_id"])
+    if not service:
+        background_tasks.add_task(send_text, phone, "Payment received, but the selected service is no longer available. Please contact support.")
+        return
+    success, booked_seats, total_amount = book_seats(
+        pending["route_service_id"], pending["seat_count"],
+        pending["phone_to_book"], pending["passenger_name"],
+    )
+    if not success:
+        background_tasks.add_task(send_text, phone, "Payment received, but the selected service is now full. Please contact support for a refund.")
+        return
+    when = service["service_time"].strftime("%I:%M %p").lstrip("0")
+    seats_text = ", ".join(str(seat) for seat in booked_seats)
+    background_tasks.add_task(
+        send_text, phone,
+        f"Booking confirmed after payment.\n\nRoute: {service['short_name']}\n"
+        f"Seats: {seats_text}\nDeparture: {when} on {service['service_date']}\n"
+        f"Amount paid: Rs {total_amount}",
+    )
+
+
+@app.post("/webhooks/razorpay")
+async def razorpay_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Confirm bookings only for a signature-verified Razorpay payment event."""
+    body = await request.body()
+    signature = request.headers.get("x-razorpay-signature", "")
+    expected = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    if not RAZORPAY_WEBHOOK_SECRET or not hmac.compare_digest(signature, expected):
+        logger.warning("rejected Razorpay webhook with invalid signature")
+        return Response(content="Invalid signature", status_code=400)
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return Response(content="Invalid JSON", status_code=400)
+    if payload.get("event") == "payment_link.paid":
+        phone = _payment_phone(payload)
+        if phone:
+            await _complete_paid_booking(phone, background_tasks)
         else:
-            send_text(from_number, "Sorry, there are no routes available right now.")
+            logger.warning("Razorpay payment webhook did not include a customer phone")
+    return {"status": "ok"}
 
 
 @app.post("/webhook")
@@ -179,13 +281,16 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
             return {"status": "ignored"}
 
         message = messages[0]
-        # Idempotency: ignore duplicate webhook deliveries for the same message id
         message_id = message.get("id")
-        if message_id and message_id in processed_message_ids:
+        if not _remember_message_id(message_id):
             logger.info("duplicate webhook delivery ignored: %s", message_id)
             return {"status": "ignored"}
-        if message_id:
-            processed_message_ids.add(message_id)
+
+        from_number = message.get("from")
+        if not from_number:
+            logger.warning("Webhook message missing from_number: %s", message)
+            return {"status": "ignored"}
+
         from_number = message["from"]
         customer_name = None
         contacts = value.get("contacts") or []
@@ -195,7 +300,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         try:
             save_customer(from_number, customer_name)
         except Exception as save_exc:
-            logger.warning("failed to save customer info: %s", save_exc)
+            logger.error("failed to save customer info: %s", save_exc, exc_info=True)
 
         msg_type = message["type"]
         logger.info("message from=%s type=%s name=%s", from_number, msg_type, customer_name)
@@ -306,67 +411,10 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                 passenger_name_for_booking = pending.get("name") or customer_name
 
                 if service:
-                    success, booked_seats, total_amount = book_seats(route_service_id, seat_count, phone_to_book, passenger_name_for_booking)
-                    if success:
-                        if pending and pending.get("action") == "collect_other":
-                            pending_actions[from_number] = {
-                                "action": "collect_other",
-                                "stage": "entry",
-                                "booking_context": {
-                                    "route_service_id": route_service_id,
-                                    "seat_numbers": booked_seats,
-                                    "original_phone": phone_to_book,
-                                    "original_customer_name": passenger_name_for_booking,
-                                },
-                            }
-                        else:
-                            pending_actions[from_number] = {
-                                "action": "await_other_post_booking",
-                                "booking_context": {
-                                    "route_service_id": route_service_id,
-                                    "seat_numbers": booked_seats,
-                                    "original_phone": phone_to_book,
-                                    "original_customer_name": passenger_name_for_booking,
-                                },
-                            }
-
-                        when = service["service_time"].strftime("%I:%M %p").lstrip("0")
-                        driver_lines = []
-                        if service.get("driver_name"):
-                            driver_lines.append(f"Driver: {service['driver_name']}")
-                        if service.get("vehicle_type") and service.get("vehicle_number"):
-                            driver_lines.append(f"Vehicle: {service['vehicle_type']} ({service['vehicle_number']})")
-                        if service.get("driver_phone"):
-                            driver_lines.append(f"Driver phone: {service['driver_phone']}")
-                        driver_text = "\n".join(driver_lines)
-                        passenger_display = passenger_name_for_booking or "Passenger"
-                        seats_text = ", ".join(str(seat) for seat in booked_seats)
-                        status_text = (
-                            f"🎉 *Congratulations! {passenger_display} — Your seats are booked.*\n"
-                            f"\n🚍 *Route:* {service['short_name']}\n"
-                            f"🪑 *Seats:* {seats_text}\n"
-                            f"🕒 *Departure:* {when} on {service['service_date']}\n"
-                            f"💰 *Amount:* Rs {total_amount}"
-                        )
-                        if driver_text:
-                            status_text += f"\n\n{driver_text}"
-                        status_text += "\n\n✨ Have a safe and pleasant ride!"
-                        status_text += "\n\nIf this ride is for someone else, please type 'other'."
-                        # Final booking confirmation: send plain text with no action buttons.
-                        background_tasks.add_task(send_text, from_number, status_text)
-                    else:
-                        left = available_seats(route_service_id)
-                        if left and service:
-                            background_tasks.add_task(send_seat_count_prompt, from_number, service, len(left))
-                        else:
-                            background_tasks.add_task(
-                                send_button_message,
-                                from_number,
-                                "Sorry, that service is fully booked or unavailable.",
-                                [
-                                    {"id": "route_more", "title": "Try another route"},
-                                ],
-                            )
+                    _queue_payment(
+                        from_number, route_service_id, seat_count, phone_to_book,
+                        passenger_name_for_booking, service, background_tasks,
+                    )
                 else:
                     background_tasks.add_task(
                         send_button_message,
@@ -382,63 +430,10 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                 if service:
                     seats = available_seats(route_service_id)
                     if seats:
-                        background_tasks.add_task(
-                            send_text,
-                            from_number,
-                            "Thanks for selecting your time. We are working on it and will confirm your seat in a moment.",
+                        _queue_payment(
+                            from_number, route_service_id, 1, from_number,
+                            customer_name, service, background_tasks,
                         )
-                        success, booked_seats, total_amount = book_seats(route_service_id, 1, from_number, customer_name)
-                        if success:
-                            if pending_actions.get(from_number, {}).get("action") == "collect_other":
-                                pending_actions[from_number] = {
-                                    "action": "collect_other",
-                                    "stage": "entry",
-                                    "booking_context": {
-                                        "route_service_id": route_service_id,
-                                        "seat_numbers": booked_seats,
-                                        "original_phone": from_number,
-                                        "original_customer_name": customer_name,
-                                    },
-                                }
-                            else:
-                                pending_actions[from_number] = {
-                                    "action": "await_other_post_booking",
-                                    "booking_context": {
-                                        "route_service_id": route_service_id,
-                                        "seat_numbers": booked_seats,
-                                        "original_phone": from_number,
-                                        "original_customer_name": customer_name,
-                                    },
-                                }
-                            when = service["service_time"].strftime("%I:%M %p").lstrip("0")
-                            passenger_display_single = customer_name or "Passenger"
-                            status_text = (
-                                f"🎉 Congratulations {passenger_display_single} | your 1 seat is booked.\n"
-                                f"\n🚍 Route: {service['short_name']}\n"
-                                f"🕒 Departure: {when} on {service['service_date']}\n"
-                                f"💰 Amount: Rs {total_amount}"
-                            )
-                            driver_lines = []
-                            if service.get("driver_name"):
-                                driver_lines.append(f"Driver: {service['driver_name']}")
-                            if service.get("vehicle_type") and service.get("vehicle_number"):
-                                driver_lines.append(f"Vehicle: {service['vehicle_type']} ({service['vehicle_number']})")
-                            if service.get("driver_phone"):
-                                driver_lines.append(f"Driver phone: {service['driver_phone']}")
-                            if driver_lines:
-                                status_text += f"\n\n{('\n'.join(driver_lines))}"
-                            status_text += "\n\nIf this ride is for someone else, please type 'other'."
-                            # Final booking confirmation: send plain text with no action buttons.
-                            background_tasks.add_task(send_text, from_number, status_text)
-                        else:
-                            background_tasks.add_task(
-                                send_button_message,
-                                from_number,
-                                "Sorry, that service is no longer available.",
-                                [
-                                    {"id": "route_more", "title": "Choose another route"},
-                                ],
-                            )
                     else:
                         background_tasks.add_task(
                             send_button_message,
@@ -459,34 +454,38 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                     )
             elif selected_id.startswith("route_"):
                 route_id = selected_id.split("_", 1)[1]
+                logger.info("route selected: %s by %s", route_id, from_number)
                 route = get_route(route_id)
                 if route:
-                    display_name = customer_name or "there"
-                    background_tasks.add_task(
-                        send_text,
-                        from_number,
-                        f"Thanks {display_name}, we are checking available seats for this route now. Please wait a moment.",
-                    )
-
-                    def delayed_service_list():
-                        time.sleep(1)
+                    try:
                         services = get_route_services(route_id)
                         for service_item in services:
                             service_item["available_seats"] = len(available_seats(service_item["id"]))
                         if services:
-                            send_service_list(from_number, route, services)
+                            logger.info("sending %d services for route %s", len(services), route_id)
+                            background_tasks.add_task(send_service_list, from_number, route, services)
                         else:
                             logger.info("no active services found for route %s", route_id)
-                            send_button_message(
+                            background_tasks.add_task(
+                                send_button_message,
                                 from_number,
                                 "Sorry, this route has no active services at the moment.",
                                 [
                                     {"id": "route_more", "title": "Try another route"},
                                 ],
                             )
-
-                    background_tasks.add_task(delayed_service_list)
+                    except Exception as e:
+                        logger.error("error getting services for route %s: %s", route_id, e, exc_info=True)
+                        background_tasks.add_task(
+                            send_button_message,
+                            from_number,
+                            "Sorry, error loading services. Please try again.",
+                            [
+                                {"id": "route_more", "title": "Try another route"},
+                            ],
+                        )
                 else:
+                    logger.warning("route not found: %s", route_id)
                     background_tasks.add_task(
                         send_button_message,
                         from_number,
@@ -612,9 +611,11 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
 
             # Otherwise, this is a fresh conversation: start with route selection.
             if msg_type == "text":
+                logger.info("sending initial route selection to %s (customer: %s)", from_number, customer_name)
                 try:
                     _send_route_selection_prompt(from_number, customer_name, background_tasks)
-                except Exception:
+                except Exception as exc:
+                    logger.error("failed to send route selection: %s", exc, exc_info=True)
                     background_tasks.add_task(
                         send_button_message,
                         from_number,
@@ -649,6 +650,21 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
 
 
 @app.get("/")
+async def website():
+    return FileResponse(SITE_FILE)
+
+
+@app.get("/api/routes")
+async def public_routes():
+    return {
+        "business_name": BUSINESS_NAME,
+        "whatsapp_number": WHATSAPP_CONTACT_NUMBER,
+        "support_email": SUPPORT_EMAIL,
+        "routes": get_routes(),
+    }
+
+
+@app.get("/health")
 async def health():
     return {"status": "running", "service": "metrotoffice-whatsapp-bot"}
 

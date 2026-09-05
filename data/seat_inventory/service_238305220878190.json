@@ -1,0 +1,49 @@
+{
+  "bookings": [
+    {
+      "amount": 50,
+      "booked_at": "2026-08-16T08:57:49.537316",
+      "customer_name": "Ravi",
+      "phone_number": "911234567890",
+      "seat_number": 1,
+      "status": "booked"
+    },
+    {
+      "amount": 50,
+      "booked_at": "2026-08-16T09:24:00.050270",
+      "customer_name": "Ravi Chaudhary",
+      "phone_number": "919654980313",
+      "seat_number": 2,
+      "status": "booked"
+    },
+    {
+      "amount": 50,
+      "booked_at": "2026-08-16T09:24:28.628322",
+      "customer_name": "Ravi Chaudhary",
+      "phone_number": "919654980313",
+      "seat_number": 3,
+      "status": "booked"
+    },
+    {
+      "amount": 50,
+      "booked_at": "2026-08-16T09:24:51.566416",
+      "customer_name": "Ravi Chaudhary",
+      "phone_number": "919654980313",
+      "seat_number": 4,
+      "status": "booked"
+    }
+  ],
+  "capacity": 4,
+  "driver_id": null,
+  "driver_name": null,
+  "driver_phone": null,
+  "id": 238305220878190,
+  "last_driver_reminder_at": null,
+  "price": 50,
+  "route_id": "route_1",
+  "route_name": "Noida 15 Metro Station to Oxygen Park Office",
+  "service_date": "2026-08-16",
+  "service_time": "15:00:00",
+  "short_name": "Noida 15 -> Oxygen Park",
+  "status": "active"
+}
