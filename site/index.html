@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Reliable shuttle rides between Noida 15 Metro Station and Oxygen Park Office.">
   <title>MetroOffice Shuttle</title>
-  <link rel="stylesheet" href="/site/styles.css">
+  <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <header class="topbar">
@@ -66,24 +66,22 @@
     </section>
   </main>
 
-  <footer><span>© <span id="year"></span> MetroOffice Shuttle</span><span>Local commute, made easier.</span><nav class="footer-links" aria-label="Legal links"><a href="/site/legal/privacy.html">Privacy</a><a href="/site/legal/terms.html">Terms</a><a href="/site/legal/refunds.html">Refunds</a><a href="/site/legal/contact.html">Contact</a></nav></footer>
+  <footer><span>© <span id="year"></span> MetroOffice Shuttle</span><span>Local commute, made easier.</span><nav class="footer-links" aria-label="Legal links"><a href="/legal/privacy.html">Privacy</a><a href="/legal/terms.html">Terms</a><a href="/legal/refunds.html">Refunds</a><a href="/legal/contact.html">Contact</a></nav></footer>
+  <script src="/site-config.js"></script>
   <script>
     const fallbackRoutes = [
       {name: 'Noida 15 Metro Station to Oxygen Park Office', short_name: 'Noida 15 → Oxygen Park', price: 50},
       {name: 'Oxygen Park Office to Noida 15 Metro Station', short_name: 'Oxygen Park → Noida 15', price: 50}
     ];
-    const phoneLink = number => number ? `https://wa.me/${number.replace(/\D/g, '')}` : '#';
+    const phoneLink = SITE_CONFIG.whatsappBookingUrl;
     const renderRoutes = routes => {
       document.querySelector('#route-list').innerHTML = routes.map((route, index) => `
         <article class="route-card"><div class="route-index">0${index + 1}</div><p class="route-label">${index === 0 ? 'Morning direction' : 'Evening direction'}</p>
         <h3>${route.short_name || route.name}</h3><p class="route-name">${route.name}</p><div class="route-footer"><strong>₹${route.price}</strong><span>per seat</span></div></article>`).join('');
     };
-    fetch('/api/routes').then(response => response.json()).then(data => {
-      renderRoutes(data.routes?.length ? data.routes : fallbackRoutes);
-      const link = phoneLink(data.whatsapp_number);
-      ['#nav-book', '#hero-book', '#book-button'].forEach(selector => document.querySelector(selector).href = link);
-      if (data.support_email) document.querySelector('#contact-copy').innerHTML = `For help, email <a href="mailto:${data.support_email}">${data.support_email}</a> or use WhatsApp.`;
-    }).catch(() => renderRoutes(fallbackRoutes));
+    renderRoutes(fallbackRoutes);
+    ['#nav-book', '#hero-book', '#book-button'].forEach(selector => document.querySelector(selector).href = phoneLink);
+    if (SITE_CONFIG.supportEmail) document.querySelector('#contact-copy').innerHTML = `For help, email <a href="mailto:${SITE_CONFIG.supportEmail}">${SITE_CONFIG.supportEmail}</a> or use WhatsApp.`;
     document.querySelector('#year').textContent = new Date().getFullYear();
   </script>
 </body>
