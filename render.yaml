@@ -1,7 +1,8 @@
-staticSites:
-  - name: metrooffice-website
-    buildCommand: ""
+services:
+  - type: static_site
+    name: metrooffice-website
     staticPublishPath: ./site
+    buildCommand: ""
     pullRequestPreviewsEnabled: false
     headers:
       - path: "/*"
