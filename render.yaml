@@ -3,7 +3,30 @@ services:
     name: metrooffice-shuttle
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    buildCommand: python -m pip install -r requirements.txt
+    startCommand: python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     autoDeploy: true
+    envVars:
+      - key: VERIFY_TOKEN
+        sync: false
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: PHONE_NUMBER_ID
+        sync: false
+      - key: GRAPH_API_VERSION
+        value: v21.0
+      - key: RAZORPAY_PAYMENT_LINK
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      - key: BUSINESS_NAME
+        value: MetroOffice Shuttle
+      - key: WHATSAPP_CONTACT_NUMBER
+        sync: false
+      - key: SUPPORT_EMAIL
+        sync: false
+      - key: SERVICE_START_HOUR
+        value: "7"
+      - key: SERVICE_END_HOUR
+        value: "19"
