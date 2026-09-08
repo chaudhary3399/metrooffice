@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .bookings import (
@@ -28,13 +28,12 @@ from .bookings import (
 )
 from .config import (
     BUSINESS_NAME,
-    RAZORPAY_PAYMENT_LINK,
-    RAZORPAY_WEBHOOK_SECRET,
     ROUTES_FILE,
     SUPPORT_EMAIL,
     VERIFY_TOKEN,
     WHATSAPP_CONTACT_NUMBER,
 )
+from .phonepe import create_payment, is_configured, verify_callback
 import yaml
 from .whatsapp import (
     send_route_list,
@@ -74,6 +73,7 @@ prompted_numbers = set()
 processed_message_ids = set()
 processed_message_times = {}
 pending_payments = {}
+pending_payments_by_transaction = {}
 
 
 def _remember_message_id(message_id: str) -> bool:
@@ -135,6 +135,15 @@ async def verify_webhook(request: Request):
     logger.warning("webhook verification failed")
     return Response(content="Verification failed", status_code=403)
 
+
+@app.get("/phonepe/return")
+async def phonepe_return():
+    """Landing page after PhonePe sends the customer back from checkout."""
+    return HTMLResponse(
+        "<h2>Payment status is being confirmed.</h2>"
+        "<p>Please return to WhatsApp for your booking confirmation.</p>"
+    )
+
 def _get_available_services_for_selection() -> list:
     services = []
     for route in get_routes():
@@ -171,11 +180,7 @@ def _send_route_selection_prompt(from_number: str, customer_name: Optional[str] 
 
 
 def _payment_message(amount: int) -> str:
-    return (
-        f"Please complete the payment of Rs {amount} using this Razorpay link:\n"
-        f"{RAZORPAY_PAYMENT_LINK}\n\n"
-        "Your booking will be confirmed automatically after Razorpay confirms the payment."
-    )
+    return f"Please complete the PhonePe payment of Rs {amount}:\n{{payment_url}}\n\nYour booking will be confirmed automatically after PhonePe confirms the payment."
 
 
 def _queue_payment(
@@ -187,39 +192,31 @@ def _queue_payment(
     service: dict,
     background_tasks: BackgroundTasks,
 ) -> None:
-    if not RAZORPAY_PAYMENT_LINK:
-        logger.error("RAZORPAY_PAYMENT_LINK is not configured")
+    if not is_configured():
+        logger.error("PhonePe is not fully configured")
         background_tasks.add_task(send_text, from_number, "Payment is temporarily unavailable. Please try again later.")
         return
     amount = int(service.get("price") or 0) * seat_count
-    pending_payments[from_number] = {
-        "route_service_id": route_service_id,
-        "seat_count": seat_count,
-        "phone_to_book": phone_to_book,
-        "passenger_name": passenger_name,
-        "amount": amount,
+    try:
+        payment = create_payment(amount, from_number)
+    except Exception as exc:
+        logger.error("PhonePe payment creation failed: %s", exc, exc_info=True)
+        background_tasks.add_task(send_text, from_number, "Payment is temporarily unavailable. Please try again later.")
+        return
+    pending = {
+        "route_service_id": route_service_id, "seat_count": seat_count,
+        "phone_to_book": phone_to_book, "passenger_name": passenger_name, "amount": amount,
     }
-    logger.info("payment requested from=%s service=%s amount=%s", from_number, route_service_id, amount)
-    background_tasks.add_task(send_text, from_number, _payment_message(amount))
-
-
-def _payment_phone(payload: dict) -> Optional[str]:
-    entity = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
-    contact = entity.get("customer", {}).get("contact") or entity.get("contact")
-    if not contact:
-        return None
-    digits = "".join(character for character in str(contact) if character.isdigit())
-    if len(digits) == 10:
-        return f"91{digits}"
-    if digits.startswith("0") and len(digits) == 11:
-        return f"91{digits[1:]}"
-    return digits or None
+    pending_payments[from_number] = pending
+    pending_payments_by_transaction[payment["merchant_order_id"]] = {"phone": from_number, **pending}
+    logger.info("PhonePe payment requested from=%s order=%s amount=%s", from_number, payment["merchant_order_id"], amount)
+    background_tasks.add_task(send_text, from_number, _payment_message(amount).replace("{payment_url}", payment["payment_url"]))
 
 
 async def _complete_paid_booking(phone: str, background_tasks: BackgroundTasks) -> None:
     pending = pending_payments.pop(phone, None)
     if not pending:
-        logger.warning("paid Razorpay webhook has no pending booking for phone=%s", phone)
+        logger.warning("paid PhonePe callback has no pending booking for phone=%s", phone)
         return
     service = get_service(pending["route_service_id"])
     if not service:
@@ -242,25 +239,26 @@ async def _complete_paid_booking(phone: str, background_tasks: BackgroundTasks) 
     )
 
 
-@app.post("/webhooks/razorpay")
-async def razorpay_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Confirm bookings only for a signature-verified Razorpay payment event."""
+@app.post("/webhooks/phonepe")
+async def phonepe_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Confirm a booking from an authenticated PhonePe v2 webhook."""
     body = await request.body()
-    signature = request.headers.get("x-razorpay-signature", "")
-    expected = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    if not RAZORPAY_WEBHOOK_SECRET or not hmac.compare_digest(signature, expected):
-        logger.warning("rejected Razorpay webhook with invalid signature")
-        return Response(content="Invalid signature", status_code=400)
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        return Response(content="Invalid JSON", status_code=400)
-    if payload.get("event") == "payment_link.paid":
-        phone = _payment_phone(payload)
-        if phone:
-            await _complete_paid_booking(phone, background_tasks)
-        else:
-            logger.warning("Razorpay payment webhook did not include a customer phone")
+    payload = verify_callback(body.decode("utf-8"), request.headers.get("Authorization"))
+    if not payload:
+        logger.warning("rejected PhonePe webhook with invalid Authorization header")
+        return Response(content="Invalid Authorization", status_code=400)
+    event = payload.get("event")
+    order = payload.get("payload", {})
+    order_id = order.get("merchantOrderId")
+    state = order.get("state")
+    pending = pending_payments_by_transaction.pop(order_id, None) if order_id else None
+    if event == "checkout.order.completed" and state == "COMPLETED" and pending:
+        pending_payments[pending["phone"]] = pending
+        await _complete_paid_booking(pending["phone"], background_tasks)
+    elif pending:
+        logger.info("PhonePe order not completed: order=%s event=%s state=%s", order_id, event, state)
+    else:
+        logger.warning("PhonePe webhook has no pending order: %s", order_id)
     return {"status": "ok"}
 
 

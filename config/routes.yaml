@@ -6,8 +6,44 @@ routes:
     short_name: "Noida 15 -> Oxygen Park"
     price: 50
     total_seats: 4
+    service_hours:
+      - hour: 7
+      - hour: 8
+      - hour: 9
+      - hour: 10
+      - hour: 11
+      - hour: 12
+      - hour: 13
+      - hour: 14
+      - hour: 15
+      - hour: 16
+      - hour: 17
+      - hour: 18
+      - hour: 19
+      - hour: 20
+      - hour: 21
+      - hour: 22
+      - hour: 23
   - id: route_2
     name: "Oxygen Park Office to Noida 15 Metro Station"
     short_name: "Oxygen Park -> Noida 15"
     price: 50
     total_seats: 4
+    service_hours:
+      - hour: 7
+      - hour: 8
+      - hour: 9
+      - hour: 10
+      - hour: 11
+      - hour: 12
+      - hour: 13
+      - hour: 14
+      - hour: 15
+      - hour: 16
+      - hour: 17
+      - hour: 18
+      - hour: 19
+      - hour: 20
+      - hour: 21
+      - hour: 22
+      - hour: 23
