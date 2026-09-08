@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Book a MetroOffice Shuttle seat through WhatsApp or by phone.">
+  <title>Book a seat | MetroOffice Shuttle</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="METRO TO OFFICE SHUTTLE SERVICE home">
+      <span class="brand-mark">M</span>
+      <span>METRO TO OFFICE SHUTTLE SERVICE</span>
+    </a>
+  </header>
+
+  <main class="legal-page">
+    <a class="legal-back" href="/">Back to home</a>
+    <p class="kicker">Booking desk</p>
+    <h1>Book your shuttle seat</h1>
+    <p>Choose the easiest way to connect with us. We can help you select your route, departure time, available seats, and payment option.</p>
+
+    <h2>Book by WhatsApp chat</h2>
+    <p>Send us a message on WhatsApp with your preferred route and travel time. Our team will guide you through the booking.</p>
+    <p><a class="button button-primary" id="whatsapp-book" href="#">Start WhatsApp chat <span>↗</span></a></p>
+
+    <h2>Connect by phone</h2>
+    <p>Call or message Priyanka at <a id="phone-book" href="tel:+919582713551">+91 95827 13551</a> for booking assistance.</p>
+
+    <p>Service: Noida 15 Metro Station and Oxygen Park Office.</p>
+  </main>
+
+  <script src="/site-config.js"></script>
+  <script>
+    document.querySelector('#whatsapp-book').href = SITE_CONFIG.whatsappBookingUrl;
+  </script>
+</body>
+</html>

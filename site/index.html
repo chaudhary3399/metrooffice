@@ -27,7 +27,7 @@
         <h1>Start work<br><span>on the way.</span></h1>
         <p class="hero-text">A simple, dependable shuttle between Noida 15 Metro Station and Oxygen Park Office. Reserve your seat on WhatsApp in a few taps.</p>
         <div class="hero-actions">
-          <a class="button button-primary" id="hero-book" href="#book">To book your seat, click here <span>↗</span></a>
+          <a class="button button-primary" id="hero-book" href="/booking.html">To book your seat, click here <span>↗</span></a>
           <a class="text-link" href="#routes">See routes and fares ↓</a>
         </div>
       </div>
@@ -80,7 +80,7 @@
         <h3>${route.short_name || route.name}</h3><p class="route-name">${route.name}</p><div class="route-footer"><strong>₹${route.price}</strong><span>per seat</span></div></article>`).join('');
     };
     renderRoutes(fallbackRoutes);
-    ['#nav-book', '#hero-book', '#book-button'].forEach(selector => document.querySelector(selector).href = phoneLink);
+    ['#nav-book', '#book-button'].forEach(selector => document.querySelector(selector).href = phoneLink);
     if (SITE_CONFIG.supportEmail) document.querySelector('#contact-copy').innerHTML = `For help, email <a href="mailto:${SITE_CONFIG.supportEmail}">${SITE_CONFIG.supportEmail}</a> or use WhatsApp.`;
     document.querySelector('#year').textContent = new Date().getFullYear();
   </script>
