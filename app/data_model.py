@@ -121,14 +121,14 @@ DEFAULT_ROUTES = [
         "id": "route_1",
         "name": "Noida 15 Metro Station to Oxygen Park Office",
         "short_name": "Noida 15 → Oxygen Park",
-        "price": 50,
+        "price": 10,
         "total_seats": 4,
     },
     {
         "id": "route_2",
         "name": "Oxygen Park Office to Noida 15 Metro Station",
         "short_name": "Oxygen Park → Noida 15",
-        "price": 50,
+        "price": 10,
         "total_seats": 4,
     },
 ]
