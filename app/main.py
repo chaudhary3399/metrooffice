@@ -165,9 +165,12 @@ async def razorpay_return(request: Request):
         "<!doctype html><html lang='en'><meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>ShuttleSeva payment</title><body style='font:16px system-ui;max-width:540px;margin:12vh auto;padding:24px'>"
         f"<h2>{heading}</h2><p>{message}</p>"
-        "<p>You can close this tab and return to the ShuttleSeva WhatsApp chat.</p>"
-        "<button onclick='window.close()' style='padding:12px 18px'>Close payment page</button>"
-        "<script>setTimeout(()=>window.close(),1200)</script></body></html>"
+        "<p>Tap below to switch back to WhatsApp. Your browser may keep this tab open.</p>"
+        "<a href='whatsapp://send' onclick='try{window.close()}catch(e){}' "
+        "style='display:inline-block;padding:14px 20px;background:#128C7E;color:white;"
+        "border-radius:8px;text-decoration:none;font-weight:600'>Return to WhatsApp</a>"
+        "<p style='color:#666'>If WhatsApp does not open, switch back to it using your phone's app switcher.</p>"
+        "</body></html>"
     )
 
 def _get_available_services_for_selection() -> list:
