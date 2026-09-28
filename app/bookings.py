@@ -364,7 +364,13 @@ def update_booking_passenger_details(
         return updated
 
 
-def book_seats(route_service_id: int, seat_count: int, phone_number: str, customer_name: Optional[str] = None) -> tuple[bool, list[int], int]:
+def book_seats(
+    route_service_id: int,
+    seat_count: int,
+    phone_number: str,
+    customer_name: Optional[str] = None,
+    fare_per_seat: Optional[int] = None,
+) -> tuple[bool, list[int], int]:
     service = get_service(route_service_id)
     if not service or service["status"] != "active":
         return False, [], 0
@@ -392,20 +398,21 @@ def book_seats(route_service_id: int, seat_count: int, phone_number: str, custom
             return False, [], 0
 
         selected = available[:seat_count]
+        booking_fare = int(fare_per_seat if fare_per_seat is not None else service.get("price") or 0)
         for seat in selected:
             booking = BookingRecord(
                 seat_number=int(seat),
                 phone_number=phone_number,
                 customer_name=customer_name,
                 status="booked",
-                amount=int(service.get("price") or 0),
+                amount=booking_fare,
             )
             bookings.append(booking.to_dict())
 
         state["bookings"] = bookings
         _write_json_atomic(_service_state_path(route_service_id), state)
 
-    total_amount = int(service.get("price") or 0) * len(selected)
+    total_amount = int(fare_per_seat if fare_per_seat is not None else service.get("price") or 0) * len(selected)
     return True, selected, total_amount
 
 

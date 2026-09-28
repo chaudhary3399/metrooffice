@@ -9,6 +9,7 @@ import json
 import logging
 import time
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, Request, Response
@@ -28,6 +29,9 @@ from .bookings import (
 )
 from .config import (
     BUSINESS_NAME,
+    CASH_FARE_RUPEES,
+    ONLINE_DISCOUNT_PERCENT,
+    ONLINE_FARE_RUPEES,
     PAYMENT_PROVIDER,
     ROUTES_FILE,
     SUPPORT_EMAIL,
@@ -146,6 +150,26 @@ async def phonepe_return():
         "<p>Please return to WhatsApp for your booking confirmation.</p>"
     )
 
+
+@app.get("/razorpay/return")
+async def razorpay_return(request: Request):
+    """Landing page Razorpay redirects to after a Payment Link finishes."""
+    link_status = request.query_params.get("razorpay_payment_link_status", "").lower()
+    if link_status == "paid":
+        heading = "Payment submitted"
+        message = "Your payment is being verified. Your booking confirmation will arrive in WhatsApp."
+    else:
+        heading = "Payment page closed"
+        message = "If you completed payment, check WhatsApp for confirmation. Otherwise, return to WhatsApp to try again."
+    return HTMLResponse(
+        "<!doctype html><html lang='en'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>ShuttleSeva payment</title><body style='font:16px system-ui;max-width:540px;margin:12vh auto;padding:24px'>"
+        f"<h2>{heading}</h2><p>{message}</p>"
+        "<p>You can close this tab and return to the ShuttleSeva WhatsApp chat.</p>"
+        "<button onclick='window.close()' style='padding:12px 18px'>Close payment page</button>"
+        "<script>setTimeout(()=>window.close(),1200)</script></body></html>"
+    )
+
 def _get_available_services_for_selection() -> list:
     services = []
     for route in get_routes():
@@ -185,9 +209,62 @@ def _active_payment_provider():
     return razorpay_provider if PAYMENT_PROVIDER == "razorpay" else phonepe_provider
 
 
-def _payment_message(amount: int) -> str:
+def _online_fare_per_seat() -> Decimal:
+    if ONLINE_FARE_RUPEES:
+        return Decimal(ONLINE_FARE_RUPEES).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    fare = Decimal(CASH_FARE_RUPEES) * Decimal(100 - ONLINE_DISCOUNT_PERCENT) / Decimal(100)
+    return fare.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _money_text(amount) -> str:
+    amount = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return f"{amount:.2f}" if amount != amount.to_integral_value() else f"{int(amount)}"
+
+
+def _payment_message(amount) -> str:
     provider_label = "Razorpay" if PAYMENT_PROVIDER == "razorpay" else "PhonePe"
-    return f"Please complete the {provider_label} payment of Rs {amount}:\n{{payment_url}}\n\nYour booking will be confirmed automatically after payment is confirmed."
+    return f"Please complete the {provider_label} payment of Rs {_money_text(amount)}:\n{{payment_url}}\n\nAfter paying, return to WhatsApp. Your booking is confirmed when the bot messages you."
+
+
+def _prompt_payment_choice(
+    from_number: str,
+    route_service_id: int,
+    seat_count: int,
+    phone_to_book: str,
+    passenger_name: Optional[str],
+    service: dict,
+    background_tasks: BackgroundTasks,
+) -> None:
+    cash_fare = Decimal(CASH_FARE_RUPEES)
+    online_fare = _online_fare_per_seat()
+    total_cash = cash_fare * seat_count
+    total_online = online_fare * seat_count
+    pending_actions[from_number] = {
+        "action": "choose_payment",
+        "route_service_id": route_service_id,
+        "seat_count": seat_count,
+        "phone_to_book": phone_to_book,
+        "passenger_name": passenger_name,
+        "service": service,
+        "cash_fare_per_seat": cash_fare,
+        "online_fare_per_seat": online_fare,
+    }
+    online_label = "test fare" if ONLINE_FARE_RUPEES else f"{ONLINE_DISCOUNT_PERCENT}% off"
+    body = (
+        f"{service['short_name']} at {service['service_time'].strftime('%I:%M %p').lstrip('0')}\n"
+        f"{seat_count} seat(s). Choose payment:\n"
+        f"Online: Rs {_money_text(total_online)} ({online_label})\n"
+        f"Cash in cab: Rs {_money_text(total_cash)}"
+    )
+    background_tasks.add_task(
+        send_button_message,
+        from_number,
+        body,
+        [
+            {"id": "payment_online", "title": f"Pay online Rs {_money_text(total_online)}"},
+            {"id": "payment_cash", "title": f"Pay cash Rs {_money_text(total_cash)}"},
+        ],
+    )
 
 
 def _queue_payment(
@@ -198,13 +275,15 @@ def _queue_payment(
     passenger_name: Optional[str],
     service: dict,
     background_tasks: BackgroundTasks,
+    fare_per_seat: Optional[Decimal] = None,
 ) -> None:
     provider = _active_payment_provider()
     if not provider.is_configured():
         logger.error("Payment provider %s is not fully configured", PAYMENT_PROVIDER)
         background_tasks.add_task(send_text, from_number, "Payment is temporarily unavailable. Please try again later.")
         return
-    amount = int(service.get("price") or 0) * seat_count
+    fare_per_seat = fare_per_seat if fare_per_seat is not None else Decimal(int(service.get("price") or 0))
+    amount = fare_per_seat * seat_count
     try:
         payment = provider.create_payment(amount, from_number)
     except Exception as exc:
@@ -213,12 +292,40 @@ def _queue_payment(
         return
     pending = {
         "route_service_id": route_service_id, "seat_count": seat_count,
-        "phone_to_book": phone_to_book, "passenger_name": passenger_name, "amount": amount,
+        "phone_to_book": phone_to_book, "passenger_name": passenger_name,
+        "amount": amount, "fare_per_seat": fare_per_seat, "payment_method": "online",
     }
     pending_payments[from_number] = pending
     pending_payments_by_transaction[payment["merchant_order_id"]] = {"phone": from_number, **pending}
-    logger.info("%s payment requested from=%s order=%s amount=%s", PAYMENT_PROVIDER, from_number, payment["merchant_order_id"], amount)
+    logger.info("%s payment requested from=%s order=%s amount=%s", PAYMENT_PROVIDER, from_number, payment["merchant_order_id"], _money_text(amount))
     background_tasks.add_task(send_text, from_number, _payment_message(amount).replace("{payment_url}", payment["payment_url"]))
+
+
+async def _book_cash(
+    from_number: str,
+    pending: dict,
+    background_tasks: BackgroundTasks,
+) -> None:
+    service = get_service(pending["route_service_id"])
+    if not service:
+        background_tasks.add_task(send_text, from_number, "Sorry, that service is no longer available. Please choose another time.")
+        return
+    success, booked_seats, total = book_seats(
+        pending["route_service_id"], pending["seat_count"],
+        pending["phone_to_book"], pending["passenger_name"],
+        fare_per_seat=int(pending["cash_fare_per_seat"]),
+    )
+    if not success:
+        background_tasks.add_task(send_text, from_number, "Sorry, those seats are no longer available. Please choose another time.")
+        return
+    when = service["service_time"].strftime("%I:%M %p").lstrip("0")
+    seats_text = ", ".join(str(seat) for seat in booked_seats)
+    background_tasks.add_task(
+        send_text, from_number,
+        f"Booking confirmed — pay cash in the cab.\n\nRoute: {service['short_name']}\n"
+        f"Seats: {seats_text}\nDeparture: {when} on {service['service_date']}\n"
+        f"Please pay Rs {_money_text(total)} in the cab.",
+    )
 
 
 async def _complete_paid_booking(phone: str, background_tasks: BackgroundTasks) -> None:
@@ -233,6 +340,7 @@ async def _complete_paid_booking(phone: str, background_tasks: BackgroundTasks) 
     success, booked_seats, total_amount = book_seats(
         pending["route_service_id"], pending["seat_count"],
         pending["phone_to_book"], pending["passenger_name"],
+        fare_per_seat=pending.get("fare_per_seat"),
     )
     if not success:
         background_tasks.add_task(send_text, phone, "Payment received, but the selected service is now full. Please contact support for a refund.")
@@ -243,7 +351,7 @@ async def _complete_paid_booking(phone: str, background_tasks: BackgroundTasks) 
         send_text, phone,
         f"Booking confirmed after payment.\n\nRoute: {service['short_name']}\n"
         f"Seats: {seats_text}\nDeparture: {when} on {service['service_date']}\n"
-        f"Amount paid: Rs {total_amount}",
+        f"Amount paid: Rs {_money_text(pending.get('amount', total_amount))}",
     )
 
 
@@ -415,6 +523,26 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                 _send_route_selection_prompt(from_number, customer_name, background_tasks)
                 return {"status": "ok"}
 
+            if selected_id in ("payment_online", "payment_cash"):
+                choice = pending_actions.pop(from_number, None)
+                if not choice or choice.get("action") != "choose_payment":
+                    background_tasks.add_task(send_text, from_number, "That payment choice has expired. Please select your route and time again.")
+                    return {"status": "ok"}
+                if selected_id == "payment_cash":
+                    await _book_cash(from_number, choice, background_tasks)
+                else:
+                    _queue_payment(
+                        from_number,
+                        choice["route_service_id"],
+                        choice["seat_count"],
+                        choice["phone_to_book"],
+                        choice["passenger_name"],
+                        choice["service"],
+                        background_tasks,
+                        fare_per_seat=choice["online_fare_per_seat"],
+                    )
+                return {"status": "ok"}
+
             if selected_id.startswith("seat_count_"):
                 parts = selected_id.split("_")
                 route_service_id = int(parts[2])
@@ -440,7 +568,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                 passenger_name_for_booking = pending.get("name") or customer_name
 
                 if service:
-                    _queue_payment(
+                    _prompt_payment_choice(
                         from_number, route_service_id, seat_count, phone_to_book,
                         passenger_name_for_booking, service, background_tasks,
                     )
@@ -459,7 +587,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                 if service:
                     seats = available_seats(route_service_id)
                     if seats:
-                        _queue_payment(
+                        _prompt_payment_choice(
                             from_number, route_service_id, 1, from_number,
                             customer_name, service, background_tasks,
                         )

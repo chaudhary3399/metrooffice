@@ -3,6 +3,7 @@ import hashlib
 import json
 import time
 import uuid
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Optional
 
 import httpx
@@ -46,14 +47,17 @@ def _get_access_token() -> str:
     return _token_cache["access_token"]
 
 
-def create_payment(amount_rupees: int, customer_phone: str) -> Dict[str, str]:
+def create_payment(amount_rupees, customer_phone: str) -> Dict[str, str]:
     merchant_order_id = f"METRO_{uuid.uuid4().hex[:24]}"
     token = _get_access_token()
+    amount_paise = int(
+        (Decimal(str(amount_rupees)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
     response = httpx.post(
         f"{PHONEPE_BASE_URL.rstrip('/')}/checkout/v2/pay",
         json={
             "merchantOrderId": merchant_order_id,
-            "amount": int(amount_rupees) * 100,
+            "amount": amount_paise,
             "expireAfter": 1200,
             "paymentFlow": {
                 "type": "PG_CHECKOUT",
