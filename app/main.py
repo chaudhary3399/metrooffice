@@ -8,7 +8,6 @@ import hmac
 import json
 import logging
 import time
-from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
@@ -23,6 +22,7 @@ from .bookings import (
     get_route_services,
     get_routes,
     get_service,
+    is_service_upcoming,
     save_customer,
     seed_today_services,
     update_booking_passenger_details,
@@ -226,7 +226,11 @@ def _money_text(amount) -> str:
 
 def _payment_message(amount) -> str:
     provider_label = "Razorpay" if PAYMENT_PROVIDER == "razorpay" else "PhonePe"
-    return f"Please complete the {provider_label} payment of Rs {_money_text(amount)}:\n{{payment_url}}\n\nAfter paying, return to WhatsApp. Your booking is confirmed when the bot messages you."
+    return (
+        f"💳 *Secure your shuttle seat*\n\n"
+        f"Pay *₹{_money_text(amount)}* with {provider_label} here:\n{{payment_url}}\n\n"
+        "✅ After payment, come back to this WhatsApp chat. We’ll message you as soon as your booking is confirmed."
+    )
 
 
 def _prompt_payment_choice(
@@ -254,18 +258,20 @@ def _prompt_payment_choice(
     }
     online_label = "test fare" if ONLINE_FARE_RUPEES else f"{ONLINE_DISCOUNT_PERCENT}% off"
     body = (
-        f"{service['short_name']} at {service['service_time'].strftime('%I:%M %p').lstrip('0')}\n"
-        f"{seat_count} seat(s). Choose payment:\n"
-        f"Online: Rs {_money_text(total_online)} ({online_label})\n"
-        f"Cash in cab: Rs {_money_text(total_cash)}"
+        f"🚌 *{service['short_name']}*\n"
+        f"🕒 {service['service_time'].strftime('%I:%M %p').lstrip('0')} · {service['service_date'].strftime('%a, %d %b')}\n"
+        f"💺 {seat_count} seat(s)\n\n"
+        f"Choose how you’d like to pay:\n"
+        f"⚡ Online: ₹{_money_text(total_online)} ({online_label})\n"
+        f"💵 Cash in cab: ₹{_money_text(total_cash)}"
     )
     background_tasks.add_task(
         send_button_message,
         from_number,
         body,
         [
-            {"id": "payment_online", "title": f"Pay online Rs {_money_text(total_online)}"},
-            {"id": "payment_cash", "title": f"Pay cash Rs {_money_text(total_cash)}"},
+            {"id": "payment_online", "title": f"Online ₹{_money_text(total_online)}"},
+            {"id": "payment_cash", "title": f"Cash ₹{_money_text(total_cash)}"},
         ],
     )
 
@@ -283,7 +289,7 @@ def _queue_payment(
     provider = _active_payment_provider()
     if not provider.is_configured():
         logger.error("Payment provider %s is not fully configured", PAYMENT_PROVIDER)
-        background_tasks.add_task(send_text, from_number, "Payment is temporarily unavailable. Please try again later.")
+        background_tasks.add_task(send_text, from_number, "⚠️ Online payment is temporarily unavailable. Please try again shortly or choose cash in the cab.")
         return
     fare_per_seat = fare_per_seat if fare_per_seat is not None else Decimal(int(service.get("price") or 0))
     amount = fare_per_seat * seat_count
@@ -291,7 +297,7 @@ def _queue_payment(
         payment = provider.create_payment(amount, from_number)
     except Exception as exc:
         logger.error("%s payment creation failed: %s", PAYMENT_PROVIDER, exc, exc_info=True)
-        background_tasks.add_task(send_text, from_number, "Payment is temporarily unavailable. Please try again later.")
+        background_tasks.add_task(send_text, from_number, "⚠️ We couldn’t start the online payment. Please try again shortly or choose cash in the cab.")
         return
     pending = {
         "route_service_id": route_service_id, "seat_count": seat_count,
@@ -311,7 +317,7 @@ async def _book_cash(
 ) -> None:
     service = get_service(pending["route_service_id"])
     if not service:
-        background_tasks.add_task(send_text, from_number, "Sorry, that service is no longer available. Please choose another time.")
+        background_tasks.add_task(send_text, from_number, "😕 Sorry, that departure is no longer available. Please choose another time.")
         return
     success, booked_seats, total = book_seats(
         pending["route_service_id"], pending["seat_count"],
@@ -319,15 +325,15 @@ async def _book_cash(
         fare_per_seat=int(pending["cash_fare_per_seat"]),
     )
     if not success:
-        background_tasks.add_task(send_text, from_number, "Sorry, those seats are no longer available. Please choose another time.")
+        background_tasks.add_task(send_text, from_number, "😕 Those seats are no longer available. Please choose another departure time.")
         return
     when = service["service_time"].strftime("%I:%M %p").lstrip("0")
     seats_text = ", ".join(str(seat) for seat in booked_seats)
     background_tasks.add_task(
         send_text, from_number,
-        f"Booking confirmed — pay cash in the cab.\n\nRoute: {service['short_name']}\n"
-        f"Seats: {seats_text}\nDeparture: {when} on {service['service_date']}\n"
-        f"Please pay Rs {_money_text(total)} in the cab.",
+        f"✅ *Your shuttle is booked!*\n\n🚌 Route: {service['short_name']}\n"
+        f"💺 Seat(s): {seats_text}\n🕒 Departure: {when} · {service['service_date'].strftime('%a, %d %b')}\n\n"
+        f"💵 Please pay *₹{_money_text(total)}* to the driver in the cab. Have a comfortable ride!",
     )
 
 
@@ -338,7 +344,7 @@ async def _complete_paid_booking(phone: str, background_tasks: BackgroundTasks) 
         return
     service = get_service(pending["route_service_id"])
     if not service:
-        background_tasks.add_task(send_text, phone, "Payment received, but the selected service is no longer available. Please contact support.")
+        background_tasks.add_task(send_text, phone, "⚠️ Payment received, but this departure is no longer available. Please contact support so we can help with your payment.")
         return
     success, booked_seats, total_amount = book_seats(
         pending["route_service_id"], pending["seat_count"],
@@ -346,15 +352,15 @@ async def _complete_paid_booking(phone: str, background_tasks: BackgroundTasks) 
         fare_per_seat=pending.get("fare_per_seat"),
     )
     if not success:
-        background_tasks.add_task(send_text, phone, "Payment received, but the selected service is now full. Please contact support for a refund.")
+        background_tasks.add_task(send_text, phone, "⚠️ Payment received, but the shuttle filled up before confirmation. Please contact support for a refund.")
         return
     when = service["service_time"].strftime("%I:%M %p").lstrip("0")
     seats_text = ", ".join(str(seat) for seat in booked_seats)
     background_tasks.add_task(
         send_text, phone,
-        f"Booking confirmed after payment.\n\nRoute: {service['short_name']}\n"
-        f"Seats: {seats_text}\nDeparture: {when} on {service['service_date']}\n"
-        f"Amount paid: Rs {_money_text(pending.get('amount', total_amount))}",
+        f"✅ *Payment received — your shuttle is booked!*\n\n🚌 Route: {service['short_name']}\n"
+        f"💺 Seat(s): {seats_text}\n🕒 Departure: {when} · {service['service_date'].strftime('%a, %d %b')}\n"
+        f"💳 Paid: *₹{_money_text(pending.get('amount', total_amount))}*\n\nThanks for booking with ShuttleSeva. Have a comfortable ride!",
     )
 
 
@@ -551,21 +557,17 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                 route_service_id = int(parts[2])
                 seat_count = int(parts[3])
                 service = get_service(route_service_id)
-                if service:
-                    now = datetime.now()
-                    svc_date = service.get("service_date")
-                    svc_time = service.get("service_time")
-                    if svc_date == now.date() and svc_time <= now.time():
-                        background_tasks.add_task(
-                            send_button_message,
-                            from_number,
-                            "Sorry, the selected departure time has already passed.",
-                            [
-                                {"id": "route_more", "title": "Choose another route"},
-                                {"id": "refresh_services", "title": "Refresh services"},
-                            ],
-                        )
-                        return {"status": "ok"}
+                if service and not is_service_upcoming(service["service_date"], service["service_time"]):
+                    background_tasks.add_task(
+                        send_button_message,
+                        from_number,
+                        "⌛ That departure has already left. Please refresh the list and choose a future time.",
+                        [
+                            {"id": "refresh_services", "title": "Refresh times"},
+                            {"id": "route_more", "title": "Choose route"},
+                        ],
+                    )
+                    return {"status": "ok"}
                 pending = pending_actions.get(from_number, {})
                 phone_to_book = pending.get("target_phone") or from_number
                 passenger_name_for_booking = pending.get("name") or customer_name
@@ -587,6 +589,17 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
             elif selected_id.startswith("service_"):
                 route_service_id = int(selected_id.split("_", 1)[1])
                 service = get_service(route_service_id)
+                if service and not is_service_upcoming(service["service_date"], service["service_time"]):
+                    background_tasks.add_task(
+                        send_button_message,
+                        from_number,
+                        "⌛ Sorry, that departure time has passed. Please refresh and choose a future departure.",
+                        [
+                            {"id": "refresh_services", "title": "Refresh times"},
+                            {"id": "route_more", "title": "Choose route"},
+                        ],
+                    )
+                    return {"status": "ok"}
                 if service:
                     seats = available_seats(route_service_id)
                     if seats:

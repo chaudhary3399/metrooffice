@@ -161,9 +161,9 @@ def send_route_list(to: str, routes: list, display_name: Optional[str] = None) -
             "type": "list",
             "header": {"type": "text", "text": "ShuttleSeva"},
             "body": {
-                "text": f"Hi {welcome_name}, welcome to ShuttleSeva. Please choose your route to see available departure times."
+                "text": f"👋 Hi {welcome_name}, welcome to ShuttleSeva!\n🚌 Choose your route to see upcoming departure times."
             },
-            "footer": {"text": "metrotooffice.in"},
+            "footer": {"text": "Comfortable rides, easy booking ✨"},
             "action": {
                 "button": "Select Route",
                 "sections": _make_sections(rows, "Available Routes")[:1],
@@ -197,9 +197,9 @@ def send_route_time_list(to: str, services: list, display_name: Optional[str] = 
             "type": "list",
             "header": {"type": "text", "text": "ShuttleSeva"},
             "body": {
-                "text": f"Hi {welcome_name}, welcome to ShuttleSeva. Tap one option to book your ride."
+                "text": f"👋 Hi {welcome_name}! Tap a route and time to book your shuttle."
             },
-            "footer": {"text": "metrotooffice.in"},
+            "footer": {"text": "Choose a future departure 🕒"},
             "action": {
                 "button": "Select Route & Time",
                 "sections": _make_sections(rows, "Route & Time")[:1],
@@ -236,8 +236,8 @@ def send_service_list(to: str, route: dict, services: list) -> dict:
         "interactive": {
             "type": "list",
             "header": {"type": "text", "text": route["short_name"][:60]},
-            "body": {"text": "Select date and time for this route."},
-            "footer": {"text": "metrotooffice.in"},
+            "body": {"text": "🕒 Choose an upcoming departure for this route."},
+            "footer": {"text": "Cash or discounted online payment available"},
             "action": {
                 "button": "Select Time",
                 "sections": _make_sections(rows, "Available Services")[:1],

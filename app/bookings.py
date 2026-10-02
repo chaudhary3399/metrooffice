@@ -13,6 +13,7 @@ from pathlib import Path
 from threading import Event, Thread
 from time import sleep
 from typing import Dict, Iterable, List, Optional
+from zoneinfo import ZoneInfo
 import fcntl
 import yaml
 
@@ -29,9 +30,26 @@ from .data_model import (
 from .whatsapp import send_text
 
 logger = logging.getLogger(__name__)
+BUSINESS_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 _driver_reminder_thread: Optional[Thread] = None
 _driver_reminder_stop_event: Optional[Event] = None
+
+
+def local_now() -> datetime:
+    return datetime.now(BUSINESS_TIMEZONE)
+
+
+def local_today() -> date:
+    return local_now().date()
+
+
+def is_service_upcoming(service_date: date, service_time: time, now: Optional[datetime] = None) -> bool:
+    current = now or local_now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=BUSINESS_TIMEZONE)
+    departure = datetime.combine(service_date, service_time, tzinfo=BUSINESS_TIMEZONE)
+    return departure > current.astimezone(BUSINESS_TIMEZONE)
 
 
 def _ensure_data_dir() -> None:
@@ -201,8 +219,8 @@ def seed_today_services() -> None:
         short_name = route.get("short_name") or route_id
         price = route.get("price") or 0
         for service_time in _service_hours_for_route(route):
-            service_id = _service_id_for(route_id, date.today(), service_time)
-            _ensure_service_state(service_id, route_id, date.today(), service_time, capacity, route_name, short_name, price)
+            service_id = _service_id_for(route_id, local_today(), service_time)
+            _ensure_service_state(service_id, route_id, local_today(), service_time, capacity, route_name, short_name, price)
 
 
 def get_routes() -> List[Dict]:
@@ -238,8 +256,9 @@ def get_route_services(route_id: str) -> List[Dict]:
 
     services = []
     for service_time in _service_hours_for_route(route):
-        service_id = _service_id_for(route_id, date.today(), service_time)
-        state = _ensure_service_state(service_id, route_id, date.today(), service_time, route.get("total_seats") or 0, route.get("name") or route_id, route.get("short_name") or route_id, route.get("price") or 0)
+        today = local_today()
+        service_id = _service_id_for(route_id, today, service_time)
+        state = _ensure_service_state(service_id, route_id, today, service_time, route.get("total_seats") or 0, route.get("name") or route_id, route.get("short_name") or route_id, route.get("price") or 0)
         services.append({
             "id": state["id"],
             "route_id": state["route_id"],
@@ -251,7 +270,7 @@ def get_route_services(route_id: str) -> List[Dict]:
             "price": state.get("price"),
             "name": state.get("route_name"),
         })
-    return [service for service in services if service["service_time"] >= datetime.now().time() or service["service_date"] > date.today()]
+    return [service for service in services if is_service_upcoming(service["service_date"], service["service_time"])]
 
 
 def get_service(route_service_id: int) -> Optional[Dict]:
@@ -275,9 +294,9 @@ def get_service(route_service_id: int) -> Optional[Dict]:
     service_date = state.get("service_date")
     service_time = state.get("service_time")
     try:
-        parsed_date = date.fromisoformat(service_date) if service_date else date.today()
+        parsed_date = date.fromisoformat(service_date) if service_date else local_today()
     except ValueError:
-        parsed_date = date.today()
+        parsed_date = local_today()
     try:
         parsed_time = datetime.strptime(service_time, "%H:%M:%S").time() if service_time else time(0, 0)
     except ValueError:
@@ -378,11 +397,10 @@ def book_seats(
     if seat_count < 1 or seat_count > DEFAULT_CONFIG.get("max_seats_per_booking", 4):
         return False, [], 0
 
-    now = datetime.now()
     try:
-        if service.get("service_date") == now.date() and service.get("service_time") <= now.time():
+        if not is_service_upcoming(service["service_date"], service["service_time"]):
             return False, [], 0
-    except Exception:
+    except (KeyError, TypeError, ValueError):
         return False, [], 0
 
     save_customer(phone_number, customer_name)
@@ -463,7 +481,11 @@ def send_driver_reminder(route_service_id: int) -> bool:
 
 def process_driver_reminders(now: Optional[datetime] = None) -> int:
     if now is None:
-        now = datetime.now()
+        now = local_now()
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=BUSINESS_TIMEZONE)
+    else:
+        now = now.astimezone(BUSINESS_TIMEZONE)
 
     sent = 0
     for route in get_routes():
@@ -471,7 +493,9 @@ def process_driver_reminders(now: Optional[datetime] = None) -> int:
             service = get_service(service_row["id"])
             if not service or service["status"] != "active":
                 continue
-            departure_dt = datetime.combine(service["service_date"], service["service_time"])  # type: ignore[arg-type]
+            departure_dt = datetime.combine(
+                service["service_date"], service["service_time"], tzinfo=BUSINESS_TIMEZONE
+            )  # type: ignore[arg-type]
             remind_at = departure_dt - timedelta(minutes=15)
             if remind_at <= now < departure_dt:
                 if send_driver_reminder(service["id"]):
