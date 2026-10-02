@@ -227,9 +227,10 @@ def _money_text(amount) -> str:
 def _payment_message(amount) -> str:
     provider_label = "Razorpay" if PAYMENT_PROVIDER == "razorpay" else "PhonePe"
     return (
-        f"💳 *Secure your shuttle seat*\n\n"
-        f"Pay *₹{_money_text(amount)}* with {provider_label} here:\n{{payment_url}}\n\n"
-        "✅ After payment, come back to this WhatsApp chat. We’ll message you as soon as your booking is confirmed."
+        f"🚌 *You’re almost ready to ride!*\n\n"
+        f"🔒 Pay *₹{_money_text(amount)}* with {provider_label} to secure your shuttle seat.\n\n"
+        "👇 Tap your secure payment link:\n{payment_url}\n\n"
+        "✅ Once payment is successful, we’ll confirm your booking right here on WhatsApp."
     )
 
 
