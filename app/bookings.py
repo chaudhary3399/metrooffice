@@ -7,10 +7,11 @@ The file lock ensures two users cannot reserve the same seat at the same time.
 import hashlib
 import json
 import logging
+import os
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread, get_ident
 from time import sleep
 from typing import Dict, Iterable, List, Optional
 from zoneinfo import ZoneInfo
@@ -34,6 +35,7 @@ BUSINESS_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 _driver_reminder_thread: Optional[Thread] = None
 _driver_reminder_stop_event: Optional[Event] = None
+_customer_store_lock = Lock()
 
 
 def local_now() -> datetime:
@@ -69,7 +71,7 @@ def _read_json(path: Path, default):
 
 def _write_json_atomic(path: Path, payload) -> None:
     _ensure_data_dir()
-    temp_path = path.with_suffix(f"{path.suffix}.tmp")
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.{get_ident()}.tmp")
     with open(temp_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
     temp_path.replace(path)
@@ -205,8 +207,9 @@ def _load_customer_store() -> Dict:
     return {}
 
 
-def seed_today_services() -> None:
-    """Create the day’s route service files from the YAML config."""
+def seed_services_for_date(target_date: Optional[date] = None) -> None:
+    """Create scheduled service files for a date from the YAML config."""
+    target_date = target_date or local_today()
     routes = _load_default_routes()
     for route in routes:
         route_id = route.get("id")
@@ -219,8 +222,13 @@ def seed_today_services() -> None:
         short_name = route.get("short_name") or route_id
         price = route.get("price") or 0
         for service_time in _service_hours_for_route(route):
-            service_id = _service_id_for(route_id, local_today(), service_time)
-            _ensure_service_state(service_id, route_id, local_today(), service_time, capacity, route_name, short_name, price)
+            service_id = _service_id_for(route_id, target_date, service_time)
+            _ensure_service_state(service_id, route_id, target_date, service_time, capacity, route_name, short_name, price)
+
+
+def seed_today_services() -> None:
+    """Create today's route service files from the YAML config."""
+    seed_services_for_date(local_today())
 
 
 def get_routes() -> List[Dict]:
@@ -249,28 +257,49 @@ def get_route(route_id: str) -> Optional[Dict]:
 
 
 def get_route_services(route_id: str) -> List[Dict]:
-    routes = _load_default_routes()
-    route = next((item for item in routes if str(item.get("id") or item.get("route_id")) == str(route_id)), None)
-    if route is None:
-        return []
+    services = [
+        service for service in list_services_for_date(local_today())
+        if str(service["route_id"]) == str(route_id)
+    ]
+    return [
+        service for service in services
+        if service["status"] == "active"
+        and is_service_upcoming(service["service_date"], service["service_time"])
+    ]
 
+
+def list_services_for_date(target_date: date) -> List[Dict]:
+    """Return persisted services for one date, including operator-edited rides."""
+    _ensure_data_dir()
     services = []
-    for service_time in _service_hours_for_route(route):
-        today = local_today()
-        service_id = _service_id_for(route_id, today, service_time)
-        state = _ensure_service_state(service_id, route_id, today, service_time, route.get("total_seats") or 0, route.get("name") or route_id, route.get("short_name") or route_id, route.get("price") or 0)
-        services.append({
-            "id": state["id"],
-            "route_id": state["route_id"],
-            "service_date": date.fromisoformat(state["service_date"]),
-            "service_time": datetime.strptime(state["service_time"], "%H:%M:%S").time(),
-            "status": state.get("status", "active"),
-            "capacity": state.get("capacity"),
-            "short_name": state.get("short_name"),
-            "price": state.get("price"),
-            "name": state.get("route_name"),
-        })
-    return [service for service in services if is_service_upcoming(service["service_date"], service["service_time"])]
+    for path in sorted(SEAT_DIR.glob("service_*.json")):
+        try:
+            service_id = int(path.stem.removeprefix("service_"))
+        except ValueError:
+            continue
+        service = get_service(service_id)
+        if service and service["service_date"] == target_date:
+            state = _read_service_state(service_id) or {}
+            bookings = [item for item in state.get("bookings", []) if item.get("status") == "booked"]
+            service["booked_count"] = len(bookings)
+            service["cash_due"] = sum(
+                float(item.get("amount", 0)) for item in bookings
+                if item.get("payment_status", "unknown") == "cash_due"
+            )
+            service["cash_collected"] = sum(
+                float(item.get("amount", 0)) for item in bookings
+                if item.get("payment_status", "unknown") == "cash_collected"
+            )
+            service["paid_online"] = sum(
+                float(item.get("amount", 0)) for item in bookings
+                if item.get("payment_status", "unknown") == "paid_online"
+            )
+            service["passenger_count"] = len({
+                (item.get("phone_number") or "", item.get("customer_name") or "")
+                for item in bookings
+            })
+            services.append(service)
+    return sorted(services, key=lambda item: (item["service_time"], item["short_name"]))
 
 
 def get_service(route_service_id: int) -> Optional[Dict]:
@@ -320,14 +349,15 @@ def get_service(route_service_id: int) -> Optional[Dict]:
 
 
 def save_customer(phone_number: str, customer_name: Optional[str] = None) -> None:
-    data = _load_customer_store()
-    customer = CustomerRecord(
-        phone_number=phone_number,
-        customer_name=customer_name or data.get(phone_number, {}).get("customer_name"),
-        last_seen=datetime.utcnow().isoformat(),
-    )
-    data[phone_number] = customer.to_dict()
-    _write_json_atomic(CUSTOMERS_FILE, data)
+    with _customer_store_lock:
+        data = _load_customer_store()
+        customer = CustomerRecord(
+            phone_number=phone_number,
+            customer_name=customer_name or data.get(phone_number, {}).get("customer_name"),
+            last_seen=datetime.utcnow().isoformat(),
+        )
+        data[phone_number] = customer.to_dict()
+        _write_json_atomic(CUSTOMERS_FILE, data)
 
 
 def _read_service_state(service_id: int) -> Optional[Dict]:
@@ -389,7 +419,8 @@ def book_seats(
     phone_number: str,
     customer_name: Optional[str] = None,
     fare_per_seat: Optional[int] = None,
-) -> tuple[bool, list[int], int]:
+    payment_method: str = "cash",
+) -> tuple[bool, list[int], float]:
     service = get_service(route_service_id)
     if not service or service["status"] != "active":
         return False, [], 0
@@ -416,7 +447,8 @@ def book_seats(
             return False, [], 0
 
         selected = available[:seat_count]
-        booking_fare = int(fare_per_seat if fare_per_seat is not None else service.get("price") or 0)
+        booking_fare = float(fare_per_seat if fare_per_seat is not None else service.get("price") or 0)
+        payment_status = "paid_online" if payment_method == "online" else "cash_due"
         for seat in selected:
             booking = BookingRecord(
                 seat_number=int(seat),
@@ -424,14 +456,121 @@ def book_seats(
                 customer_name=customer_name,
                 status="booked",
                 amount=booking_fare,
+                payment_method=payment_method,
+                payment_status=payment_status,
             )
             bookings.append(booking.to_dict())
 
         state["bookings"] = bookings
         _write_json_atomic(_service_state_path(route_service_id), state)
 
-    total_amount = int(fare_per_seat if fare_per_seat is not None else service.get("price") or 0) * len(selected)
+    total_amount = float(fare_per_seat if fare_per_seat is not None else service.get("price") or 0) * len(selected)
     return True, selected, total_amount
+
+
+def get_service_manifest(route_service_id: int) -> Optional[Dict]:
+    """Return passenger and payment rows plus cash totals for an operational manifest."""
+    service = get_service(route_service_id)
+    state = _read_service_state(route_service_id)
+    if service is None or state is None:
+        return None
+    passengers = []
+    for booking in state.get("bookings", []):
+        if booking.get("status") != "booked":
+            continue
+        passengers.append({
+            "seat_number": int(booking.get("seat_number", 0)),
+            "phone_number": booking.get("phone_number", ""),
+            "customer_name": booking.get("customer_name") or "Passenger",
+            "amount": float(booking.get("amount", 0)),
+            "payment_method": booking.get("payment_method", "unknown"),
+            "payment_status": booking.get("payment_status", "unknown"),
+        })
+    passengers.sort(key=lambda item: item["seat_number"])
+    return {
+        "service": service,
+        "passengers": passengers,
+        "cash_due": sum(item["amount"] for item in passengers if item["payment_status"] == "cash_due"),
+        "cash_collected": sum(item["amount"] for item in passengers if item["payment_status"] == "cash_collected"),
+        "paid_online": sum(item["amount"] for item in passengers if item["payment_status"] == "paid_online"),
+    }
+
+
+def update_service(route_service_id: int, updates: Dict) -> Dict:
+    """Update an individual ride without changing its stable service ID."""
+    with _service_lock(route_service_id):
+        state = _read_service_state(route_service_id)
+        if state is None:
+            raise FileNotFoundError("Service not found")
+        allowed = {"service_date", "service_time", "price", "driver_name", "driver_phone"}
+        if set(updates) - allowed:
+            raise ValueError("Unsupported service field")
+        booked_count = sum(1 for item in state.get("bookings", []) if item.get("status") == "booked")
+        if "service_date" in updates:
+            parsed_date = date.fromisoformat(str(updates["service_date"]))
+            state["service_date"] = parsed_date.isoformat()
+        if "service_time" in updates:
+            parsed_time = time.fromisoformat(str(updates["service_time"]))
+            state["service_time"] = parsed_time.strftime("%H:%M:%S")
+        current_date = date.fromisoformat(state["service_date"])
+        current_time = time.fromisoformat(state["service_time"])
+        if not is_service_upcoming(current_date, current_time):
+            raise ValueError("Ride must be scheduled in the future")
+        for other in list_services_for_date(current_date):
+            if (
+                other["id"] != route_service_id
+                and other["route_id"] == state["route_id"]
+                and other["service_time"] == current_time
+                and other["status"] == "active"
+            ):
+                raise ValueError("Another active ride already uses this route and departure time")
+        if "price" in updates:
+            price = int(updates["price"])
+            if price < 0:
+                raise ValueError("Fare cannot be negative")
+            state["price"] = price
+        if "driver_name" in updates:
+            state["driver_name"] = str(updates["driver_name"]).strip() or None
+        if "driver_phone" in updates:
+            state["driver_phone"] = str(updates["driver_phone"]).strip() or None
+        if booked_count > int(state.get("capacity", 0)):
+            raise ValueError("Capacity cannot be lower than booked seats")
+        _write_json_atomic(_service_state_path(route_service_id), state)
+    return get_service(route_service_id) or {}
+
+
+def cancel_service(route_service_id: int) -> tuple[Dict, List[str]]:
+    """Cancel a ride and return unique booked passenger numbers for notification."""
+    with _service_lock(route_service_id):
+        state = _read_service_state(route_service_id)
+        if state is None:
+            raise FileNotFoundError("Service not found")
+        state["status"] = "cancelled"
+        recipients = sorted({
+            str(item.get("phone_number")) for item in state.get("bookings", [])
+            if item.get("status") == "booked" and item.get("phone_number")
+        })
+        _write_json_atomic(_service_state_path(route_service_id), state)
+    return get_service(route_service_id) or {}, recipients
+
+
+def mark_cash_collected(route_service_id: int, seat_number: int) -> bool:
+    """Mark a cash fare collected for one booked seat."""
+    with _service_lock(route_service_id):
+        state = _read_service_state(route_service_id)
+        if state is None:
+            return False
+        for booking in state.get("bookings", []):
+            if int(booking.get("seat_number", 0)) != seat_number or booking.get("status") != "booked":
+                continue
+            if booking.get("payment_method", "unknown") != "cash":
+                raise ValueError("Only cash bookings can be marked collected")
+            if booking.get("payment_status", "unknown") == "cash_collected":
+                return True
+            booking["payment_status"] = "cash_collected"
+            _write_json_atomic(_service_state_path(route_service_id), state)
+            return True
+    return False
 
 
 def book_seat(route_service_id: int, seat: int, phone_number: str, customer_name: Optional[str] = None) -> bool:

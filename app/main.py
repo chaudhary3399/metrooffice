@@ -7,27 +7,39 @@ import hashlib
 import hmac
 import json
 import logging
+import secrets
 import time
+from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
-from fastapi import BackgroundTasks, FastAPI, Request, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 
 from .bookings import (
     available_seats,
     book_seats,
+    cancel_service,
+    get_service_manifest,
     get_route,
     get_route_services,
     get_routes,
     get_service,
     is_service_upcoming,
+    list_services_for_date,
+    local_today,
+    mark_cash_collected,
     save_customer,
     seed_today_services,
+    seed_services_for_date,
     update_booking_passenger_details,
+    update_service,
 )
 from .config import (
+    ADMIN_PASSWORD,
+    ADMIN_USERNAME,
     BUSINESS_NAME,
     CASH_FARE_RUPEES,
     ONLINE_DISCOUNT_PERCENT,
@@ -58,10 +70,44 @@ logger = logging.getLogger("metrooffice")
 
 app = FastAPI(title="ShuttleSeva WhatsApp Bot")
 SITE_FILE = ROUTES_FILE.parent.parent / "site" / "index.html"
+ADMIN_FILE = ROUTES_FILE.parent.parent / "site" / "admin.html"
 app.mount("/site", StaticFiles(directory=SITE_FILE.parent), name="site")
+admin_security = HTTPBasic(auto_error=False)
+
+
+@app.middleware("http")
+async def hide_admin_static_alias(request: Request, call_next):
+    if request.url.path == "/site/admin.html":
+        return Response(content="Not found", status_code=404)
+    return await call_next(request)
+
+
+def require_admin(
+    request: Request,
+    credentials: Optional[HTTPBasicCredentials] = Depends(admin_security),
+) -> str:
+    """Require an explicitly configured admin account for operational endpoints."""
+    if not ADMIN_USERNAME or not ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="Admin access is not configured")
+    if credentials is None or not (
+        secrets.compare_digest(credentials.username, ADMIN_USERNAME)
+        and secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid admin credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    origin = request.headers.get("origin")
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and origin:
+        expected_origin = f"{request.url.scheme}://{request.url.netloc}"
+        if not secrets.compare_digest(origin.rstrip("/"), expected_origin.rstrip("/")):
+            raise HTTPException(status_code=403, detail="Cross-origin admin request rejected")
+    return credentials.username
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    seed_today_services()
     logger.info("Startup complete. File-backed booking mode is active.")
 
 latest_event = {}
@@ -100,17 +146,17 @@ def _remember_message_id(message_id: str) -> bool:
     processed_message_times[message_id] = now
     return True
 
-@app.get("/debug/last-event")
+@app.get("/debug/last-event", dependencies=[Depends(require_admin)])
 async def debug_last_event():
     """Return the last webhook payload received by the bot."""
     return {"last_event": latest_event}
 
-@app.get("/debug/info")
+@app.get("/debug/info", dependencies=[Depends(require_admin)])
 async def debug_info_route():
     """Return debug stats about webhook and verification activity."""
     return debug_info
 
-@app.get("/admin/seed-services")
+@app.post("/admin/seed-services", dependencies=[Depends(require_admin)])
 async def admin_seed_services():
     """Seed today’s routes and hourly services from the default route config."""
     try:
@@ -119,6 +165,113 @@ async def admin_seed_services():
     except Exception as exc:
         logger.error("failed to seed today\'s services: %s", exc, exc_info=True)
         return {"status": "error", "error": str(exc)}
+
+
+@app.get("/admin", dependencies=[Depends(require_admin)])
+async def admin_dashboard():
+    """Serve the protected ride operations dashboard."""
+    return FileResponse(ADMIN_FILE)
+
+
+@app.get("/admin/api/services", dependencies=[Depends(require_admin)])
+async def admin_services(service_date: Optional[date] = None):
+    target_date = service_date or local_today()
+    return {"services": list_services_for_date(target_date), "service_date": target_date}
+
+
+@app.post("/admin/api/services/seed", dependencies=[Depends(require_admin)])
+async def admin_seed_date(service_date: date):
+    seed_services_for_date(service_date)
+    return {"status": "ok", "service_date": service_date, "services": len(list_services_for_date(service_date))}
+
+
+@app.get("/admin/api/services/{service_id}/manifest", dependencies=[Depends(require_admin)])
+async def admin_service_manifest(service_id: int):
+    manifest = get_service_manifest(service_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    return manifest
+
+
+@app.patch("/admin/api/services/{service_id}", dependencies=[Depends(require_admin)])
+async def admin_update_service(service_id: int, request: Request, background_tasks: BackgroundTasks):
+    try:
+        updates = await request.json()
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("Provide at least one ride field to update")
+        previous_manifest = get_service_manifest(service_id)
+        service = update_service(service_id, updates)
+        notified = 0
+        if previous_manifest and (
+            previous_manifest["service"]["service_date"] != service["service_date"]
+            or previous_manifest["service"]["service_time"] != service["service_time"]
+        ):
+            recipients = sorted({
+                row["phone_number"] for row in previous_manifest["passengers"]
+                if row.get("phone_number")
+            })
+            for phone in recipients:
+                background_tasks.add_task(_send_reschedule_notice, phone, service)
+            notified = len(recipients)
+        logger.info("admin updated ride id=%s fields=%s", service_id, sorted(updates))
+        return {"status": "ok", "service": service, "passenger_notifications_queued": notified}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _send_reschedule_notice(to: str, service: dict) -> None:
+    date_text = service["service_date"].strftime("%a, %d %b")
+    time_text = service["service_time"].strftime("%I:%M %p").lstrip("0")
+    message = (
+        f"Ride update: your {service['short_name']} shuttle is now scheduled for "
+        f"{date_text} at {time_text}. Please contact support if this no longer works for you."
+    )
+    try:
+        send_text(to, message)
+    except Exception:
+        logger.exception("failed to send ride reschedule message to %s", to)
+
+
+def _send_cancellation_notice(to: str, service: dict) -> None:
+    date_text = service["service_date"].strftime("%a, %d %b")
+    time_text = service["service_time"].strftime("%I:%M %p").lstrip("0")
+    message = (
+        f"Important: your {service['short_name']} shuttle on {date_text} at {time_text} "
+        "has been cancelled. Please contact support to arrange another ride or discuss your payment."
+    )
+    try:
+        send_text(to, message)
+    except Exception:
+        logger.exception("failed to send ride cancellation message to %s", to)
+
+
+@app.post("/admin/api/services/{service_id}/cancel", dependencies=[Depends(require_admin)])
+async def admin_cancel_service(service_id: int, background_tasks: BackgroundTasks):
+    try:
+        service, recipients = cancel_service(service_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    for phone in recipients:
+        background_tasks.add_task(_send_cancellation_notice, phone, service)
+    logger.warning("admin cancelled ride id=%s passenger_recipients=%d", service_id, len(recipients))
+    return {
+        "status": "cancelled",
+        "passenger_notifications_queued": len(recipients),
+        "note": "WhatsApp may require an approved template if the customer-service window has expired.",
+    }
+
+
+@app.post("/admin/api/services/{service_id}/seats/{seat_number}/cash-collected", dependencies=[Depends(require_admin)])
+async def admin_mark_cash_collected(service_id: int, seat_number: int):
+    try:
+        updated = mark_cash_collected(service_id, seat_number)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail="Booked seat not found")
+    return {"status": "cash_collected", "seat_number": seat_number}
 
 @app.get("/webhook")
 async def verify_webhook(request: Request):
@@ -212,10 +365,11 @@ def _active_payment_provider():
     return razorpay_provider if PAYMENT_PROVIDER == "razorpay" else phonepe_provider
 
 
-def _online_fare_per_seat() -> Decimal:
+def _online_fare_per_seat(cash_fare: Optional[Decimal] = None) -> Decimal:
     if ONLINE_FARE_RUPEES:
         return Decimal(ONLINE_FARE_RUPEES).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    fare = Decimal(CASH_FARE_RUPEES) * Decimal(100 - ONLINE_DISCOUNT_PERCENT) / Decimal(100)
+    base_fare = cash_fare if cash_fare is not None else Decimal(CASH_FARE_RUPEES)
+    fare = base_fare * Decimal(100 - ONLINE_DISCOUNT_PERCENT) / Decimal(100)
     return fare.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
@@ -243,8 +397,8 @@ def _prompt_payment_choice(
     service: dict,
     background_tasks: BackgroundTasks,
 ) -> None:
-    cash_fare = Decimal(CASH_FARE_RUPEES)
-    online_fare = _online_fare_per_seat()
+    cash_fare = Decimal(str(service.get("price") or CASH_FARE_RUPEES))
+    online_fare = _online_fare_per_seat(cash_fare)
     total_cash = cash_fare * seat_count
     total_online = online_fare * seat_count
     pending_actions[from_number] = {
@@ -324,6 +478,7 @@ async def _book_cash(
         pending["route_service_id"], pending["seat_count"],
         pending["phone_to_book"], pending["passenger_name"],
         fare_per_seat=int(pending["cash_fare_per_seat"]),
+        payment_method="cash",
     )
     if not success:
         background_tasks.add_task(send_text, from_number, "😕 Those seats are no longer available. Please choose another departure time.")
@@ -351,6 +506,7 @@ async def _complete_paid_booking(phone: str, background_tasks: BackgroundTasks) 
         pending["route_service_id"], pending["seat_count"],
         pending["phone_to_book"], pending["passenger_name"],
         fare_per_seat=pending.get("fare_per_seat"),
+        payment_method="online",
     )
     if not success:
         background_tasks.add_task(send_text, phone, "⚠️ Payment received, but the shuttle filled up before confirmation. Please contact support for a refund.")
@@ -843,7 +999,7 @@ async def health():
     return {"status": "running", "service": "metrotoffice-whatsapp-bot"}
 
 
-@app.get("/admin/check-whatsapp")
+@app.get("/admin/check-whatsapp", dependencies=[Depends(require_admin)])
 async def admin_check_whatsapp():
     """Admin endpoint to validate the configured WhatsApp token and phone id.
 

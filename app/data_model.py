@@ -15,7 +15,9 @@ class BookingRecord:
     phone_number: str
     customer_name: Optional[str] = None
     status: str = "booked"  # booked, cancelled
-    amount: int = 0
+    amount: float = 0
+    payment_method: str = "cash"
+    payment_status: str = "cash_due"  # cash_due, cash_collected, paid_online, unknown
     booked_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
     def to_dict(self) -> Dict:
@@ -28,7 +30,9 @@ class BookingRecord:
             phone_number=data.get("phone_number", ""),
             customer_name=data.get("customer_name"),
             status=data.get("status", "booked"),
-            amount=int(data.get("amount", 0)),
+            amount=float(data.get("amount", 0)),
+            payment_method=data.get("payment_method", "unknown"),
+            payment_status=data.get("payment_status", "unknown"),
             booked_at=data.get("booked_at", datetime.utcnow().isoformat()),
         )
 
